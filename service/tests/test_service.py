@@ -23,7 +23,7 @@ SUB = {"fileUrl": "https://f/work.pdf"}
 
 def test_clamps_marks_and_grades():
     seen = {}
-    def fake(system, text, images, want_out=3000):
+    def fake(system, text, images, want_out=3000, **kw):
         seen["images"], seen["text"] = images, text
         return "```json\n" + json.dumps(GOOD) + "\n```", "fake"
     out = grader_core.grade_submission(ASSIGN, SUB, fetch, fake)
@@ -53,7 +53,7 @@ def test_no_scheme_never_calls_ai():
 
 def test_bad_json_retries_once_then_teacher():
     calls = []
-    def fake(system, text, images, want_out=3000):
+    def fake(system, text, images, want_out=3000, **kw):
         calls.append(1); return "sorry, here are the marks: 3/3", "fake"
     out = grader_core.grade_submission(ASSIGN, SUB, fetch, fake)
     assert len(calls) == 2 and out.status == "needs_teacher" and "bad_ai_reply" in out.flags
@@ -61,7 +61,7 @@ def test_bad_json_retries_once_then_teacher():
 
 def test_low_confidence_flagged():
     low = json.loads(json.dumps(GOOD)); low["questions"][0]["confidence"] = 0.3
-    out = grader_core.grade_submission(ASSIGN, SUB, fetch, lambda s, t, i, want_out=3000: (json.dumps(low), "f"))
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, lambda s, t, i, want_out=3000, **kw: (json.dumps(low), "f"))
     assert "low_confidence" in out.flags
 
 
@@ -97,7 +97,7 @@ class FakeStore:
 
 def test_worker_saves_draft_and_never_touches_final_grade():
     st = FakeStore()
-    assert worker.drain(st, fetch=fetch, complete=lambda s, t, i, want_out=3000: (json.dumps(GOOD), "f")) == 1
+    assert worker.drain(st, fetch=fetch, complete=lambda s, t, i, want_out=3000, **kw: (json.dumps(GOOD), "f")) == 1
     assert st.status[0] == "done" and st.saved.total_awarded == 3
 
 
@@ -106,3 +106,35 @@ def test_worker_provider_outage_requeues():
     def down(*a, **k): raise ProviderError("all down")
     worker.drain(st, fetch=fetch, complete=down)
     assert st.status[0] == "queued"
+
+
+def test_text_only_models_never_grade_handwriting():
+    # a scan has no text layer: images are the work, so require_vision must reach the provider call
+    FILES["https://f/scan.pdf"] = (lambda d: (d.new_page(), d.tobytes())[1])(pymupdf.open())
+    seen = {}
+    def fake(system, text, images, want_out=3000, require_vision=False):
+        seen["rv"] = require_vision; return json.dumps(GOOD), "f"
+    grader_core.grade_submission(ASSIGN, {"fileUrl": "https://f/scan.pdf"}, fetch, fake)
+    assert seen["rv"] is True
+
+
+def test_require_vision_skips_text_only_routes():
+    calls = []
+    class C:
+        def post(self, url, **kw):
+            calls.append(url)
+            class R:
+                def raise_for_status(s): pass
+                def json(s): return {"choices": [{"message": {"content": "ok"}}]}
+            return R()
+    text_only, vision = Route("t", "openai", "u1", "k", "m", 0, 100), Route("v", "openai", "u2", "k", "m", 1, 100)
+    assert complete("s", "t", ["img"], routes=[text_only, vision], client=C(), require_vision=True)[1] == "v"
+    assert calls == ["u2"]
+    with pytest.raises(ProviderError):
+        complete("s", "t", ["img"], routes=[text_only], client=C(), require_vision=True)
+
+
+def test_all_illegible_goes_to_teacher_not_zero():
+    bad = json.loads(json.dumps(GOOD)); bad["questions"][0]["legible"] = False
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, lambda s, t, i, want_out=3000, **kw: (json.dumps(bad), "f"))
+    assert out.status == "needs_teacher" and "unreadable_work" in out.flags

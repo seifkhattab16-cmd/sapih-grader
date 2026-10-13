@@ -140,12 +140,14 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
           "Use the mark scheme's own marks per question. Respond with JSON of this shape:\n" + SCHEMA
     )
     images = work.images + qp.images + ms.images + ma.images
+    # Work that is only pictures (no typed answer, no text layer) must go to a model that can see images.
+    handwritten = bool(work.images) and not typed and not work.text.strip()
 
     # 3. One AI call; ask once more with a stricter reminder if the reply is not valid JSON.
     last_err = ""
     for attempt in range(2):
         text, via = complete(SYSTEM, prompt + (f"\n\nYour last reply was invalid ({last_err}). JSON only." if attempt else ""),
-                             images, want_out=3000)
+                             images, want_out=3000, require_vision=handwritten)
         try:
             res = parse_reply(text)
             break
@@ -154,6 +156,9 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     else:
         return Outcome(status="needs_teacher", note=f"bad_ai_reply: {last_err}", flags=["bad_ai_reply"])
 
+    if all(not q.legible for q in res.questions):   # the model could not read any of it: a 0 here would be a lie
+        return Outcome(status="needs_teacher", note="unreadable_work: the AI could not read the work. Not graded.",
+                       flags=["unreadable_work"], via=via)
     flags = []
     if any(not q.legible for q in res.questions):
         flags.append("unreadable_part")

@@ -78,10 +78,15 @@ def _call(route: Route, system: str, text: str, images: list[str], client: httpx
 
 
 def complete(system: str, text: str, images: list[str] | None = None, want_out: int = 3000,
-             routes: list[Route] | None = None, client: httpx.Client | None = None) -> tuple[str, str]:
-    """Returns (reply text, provider name). Raises ProviderError when every route failed."""
+             routes: list[Route] | None = None, client: httpx.Client | None = None,
+             require_vision: bool = False) -> tuple[str, str]:
+    """Returns (reply text, provider name). Raises ProviderError when every route failed.
+    require_vision: the images ARE the work (handwriting), so a text-only model must never answer:
+    it would not see the work and would grade it as blank."""
     images = images or []
     routes = routes if routes is not None else build_routes(bool(images), want_out)
+    if require_vision and images:
+        routes = [r for r in routes if r.max_images > 0]
     if not routes:
         raise ProviderError("no AI provider key is set")
     own = client is None
