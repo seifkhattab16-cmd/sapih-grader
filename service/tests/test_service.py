@@ -30,14 +30,19 @@ def marking(awarded=True, evidence="(x-2)(x+2)", total=2, conf=0.9):
 
 class Fake:
     """Routes by system prompt: transcription (vision), first marker m1, second marker m2."""
-    def __init__(self, transcript=TRANSCRIPT, first=None, second="same", no_second=False):
+    def __init__(self, transcript=TRANSCRIPT, first=None, second="same", no_second=False, third=None):
         self.transcript, self.first, self.second, self.no_second = transcript, first or marking(), second, no_second
+        self.third = third
         self.calls = []
 
     def __call__(self, system, text, images, want_out=3000, require_vision=False, trace=None, skip=None, **kw):
         self.calls.append({"system": system[:20], "images": len(images or []), "rv": require_vision, "skip": skip})
         if system.startswith("You transcribe"):
             return json.dumps(self.transcript), "vision"
+        if skip and "m2" in skip:
+            if self.third is None:
+                raise ProviderError("no third model")
+            return json.dumps(self.third), "m3"
         if skip and "m1" in skip:
             if self.no_second:
                 raise ProviderError("only one model")
@@ -69,10 +74,17 @@ def test_blank_answer_with_only_question_label_scores_zero():
     assert out.total_awarded == 0 and "evidence_not_found" in out.flags
 
 
-def test_markers_disagree_uses_lower_and_flags():
+def test_markers_disagree_without_third_uses_lower_and_flags():
     f = Fake(first=marking(total=2), second=marking(awarded=False, evidence="", total=0))
     out = grader_core.grade_submission(ASSIGN, SUB, fetch, f)
-    assert out.total_awarded == 0 and "markers_disagree" in out.flags and out.confidence <= 0.4
+    assert out.total_awarded == 0 and "markers_disagree" in out.flags and out.confidence <= 0.5
+
+
+def test_third_marker_breaks_the_tie_by_majority():
+    # one strict marker must not drag a correct answer down: two of three agree on full marks
+    f = Fake(first=marking(total=2), second=marking(awarded=False, evidence="", total=0), third=marking(total=2))
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, f)
+    assert out.total_awarded == 2 and "markers_disagree" in out.flags and out.via.endswith("m3")
 
 
 def test_single_marker_flagged_when_no_second_model():

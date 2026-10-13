@@ -31,7 +31,7 @@ def build_routes(need_vision: bool, want_out: int = 3000) -> list[Route]:
     gk = C.env("GROQ_API_KEY")
     if gk:
         vision = C.env("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
-        texts = C.lst(C.env("GROQ_TEXT_MODELS", "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b"))
+        texts = C.lst(C.env("GROQ_TEXT_MODELS", "openai/gpt-oss-120b,qwen/qwen3.8-27b"))
 
         def mk(model: str, imgs: int) -> Route:
             return Route(f"groq:{model}", "openai", "https://api.groq.com/openai/v1/chat/completions", gk, model,

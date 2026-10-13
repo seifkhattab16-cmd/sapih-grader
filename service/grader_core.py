@@ -305,14 +305,29 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
             verify_evidence(q2, work_text)
             reconcile(q2)
         alt = {_lead(q.ref): q for q in res2.questions}
-        for q in res.questions:
-            o = alt.get(_lead(q.ref))
-            if o is not None and o.awarded_marks != q.awarded_marks:
-                flags.append("markers_disagree")
-                q.reason = (q.reason + f" | Second marker ({via3}) gave {o.awarded_marks}/{o.max_marks}; "
-                            "the lower mark is used.").strip(" |")
-                q.awarded_marks = min(q.awarded_marks, o.awarded_marks)
-                q.confidence = min(q.confidence, 0.4)
+        disagree = [q for q in res.questions
+                    if alt.get(_lead(q.ref)) is not None and alt[_lead(q.ref)].awarded_marks != q.awarded_marks]
+        if disagree:
+            flags.append("markers_disagree")
+            alt3, via4 = {}, ""
+            try:                                  # a third, different model breaks the tie
+                res3, via4 = _ask(complete, MARK_SYSTEM, p2, mark_images, parse_reply, trace,
+                                  require_vision=bool(mark_images), skip=[via2, via3])
+                for q3 in res3.questions:
+                    verify_evidence(q3, work_text)
+                    reconcile(q3)
+                alt3 = {_lead(q.ref): q for q in res3.questions}
+                via_all.append(via4)
+            except Exception:
+                pass
+            for q in disagree:
+                o, t = alt[_lead(q.ref)], alt3.get(_lead(q.ref))
+                vals = [q.awarded_marks, o.awarded_marks] + ([t.awarded_marks] if t else [])
+                new = sorted(vals)[1] if t else min(vals)       # median of three, else the lower mark
+                q.reason = (q.reason + f" | Markers gave {vals} ({via2}, {via3}" + (f", {via4}" if t else "")
+                            + f"); used {new}.").strip(" |")
+                q.awarded_marks = new
+                q.confidence = min(q.confidence, 0.5)
     for q in res.questions:
         t = next((x for x in transcript if _lead(x["ref"]) == _lead(q.ref)), None)
         q.transcription = (t["transcription"] if t else typed)[:1500]
