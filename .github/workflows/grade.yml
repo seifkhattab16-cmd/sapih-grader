@@ -28,9 +28,3 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python -m service.run_once
-  # Scheduled workflows stop after 60 days without repo activity: this commits a tiny heartbeat monthly.
-  heartbeat:
-    runs-on: ubuntu-latest
-    if: github.event.schedule == '*/5 * * * *' && false
-    steps:
-      - run: echo unused
