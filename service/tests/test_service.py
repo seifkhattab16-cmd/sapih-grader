@@ -112,7 +112,7 @@ def test_text_only_models_never_grade_handwriting():
     # a scan has no text layer: images are the work, so require_vision must reach the provider call
     FILES["https://f/scan.pdf"] = (lambda d: (d.new_page(), d.tobytes())[1])(pymupdf.open())
     seen = {}
-    def fake(system, text, images, want_out=3000, require_vision=False):
+    def fake(system, text, images, want_out=3000, require_vision=False, **kw):
         seen["rv"] = require_vision; return json.dumps(GOOD), "f"
     grader_core.grade_submission(ASSIGN, {"fileUrl": "https://f/scan.pdf"}, fetch, fake)
     assert seen["rv"] is True

@@ -23,6 +23,12 @@ class Store:
         self.c.patch(self._u("grading_jobs"), headers=self._h(),
                      params={"status": "eq.running", "updated_at": f"lt.{cutoff}"}, json={"status": "queued"}).raise_for_status()
 
+    def requeue_all(self, statuses=("needs_teacher", "failed", "done")) -> None:
+        """Teacher asked for a re-grade (workflow checkbox). Approved grades are never overwritten (save_grade checks)."""
+        self.c.patch(self._u("grading_jobs"), headers=self._h(),
+                     params={"status": f"in.({','.join(statuses)})"},
+                     json={"status": "queued", "attempts": 0, "note": None, "updated_at": _now()}).raise_for_status()
+
     def claim_next(self) -> dict | None:
         """Takes the oldest queued job. The PATCH only matches a row still 'queued', so two workers never get the same job."""
         r = self.c.get(self._u("grading_jobs"), headers=self._h(), params={

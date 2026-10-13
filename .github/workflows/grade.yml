@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      requeue:
+        description: "Re-grade everything (done, needs teacher, failed)"
+        type: boolean
+        default: false
 concurrency:
   group: grade
   cancel-in-progress: false
@@ -27,4 +32,5 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REQUEUE: ${{ inputs.requeue }}
         run: python -m service.run_once

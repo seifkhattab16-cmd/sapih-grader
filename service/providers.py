@@ -44,9 +44,17 @@ def build_routes(need_vision: bool, want_out: int = 3000) -> list[Route]:
             by["groq"] += [mk(m, 0) for m in texts]
     ok = C.env("OPENROUTER_API_KEY")
     if ok:
-        for m in C.lst(C.env("OPENROUTER_MODELS", "inclusionai/ling-3.0-flash-sante:free,apodex/apodex-1.1-mini:free")):
+        # Only models that accept images are used for image requests (the old defaults were text-only
+        # and answered "illegible" without seeing the page). Free models come and go: see
+        # https://openrouter.ai/models?input_modalities=image&max_price=0
+        if need_vision:
+            models, imgs = C.lst(C.env("OPENROUTER_VISION_MODELS",
+                "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")), 4
+        else:
+            models, imgs = C.lst(C.env("OPENROUTER_MODELS", "google/gemma-4-31b-it:free,inclusionai/ling-3.0-flash:free")), 0
+        for m in models:
             by["openrouter"].append(Route(f"openrouter:{m}", "openai", "https://openrouter.ai/api/v1/chat/completions",
-                                          ok, m, 4, min(want_out, 3000), headers={"X-Title": "Saiph grader"}))
+                                          ok, m, imgs, min(want_out, 3000), headers={"X-Title": "Saiph grader"}))
     ak = C.env("ANTHROPIC_API_KEY")
     if ak:
         by["anthropic"].append(Route("anthropic", "anthropic", "https://api.anthropic.com/v1/messages", ak,
@@ -79,7 +87,7 @@ def _call(route: Route, system: str, text: str, images: list[str], client: httpx
 
 def complete(system: str, text: str, images: list[str] | None = None, want_out: int = 3000,
              routes: list[Route] | None = None, client: httpx.Client | None = None,
-             require_vision: bool = False) -> tuple[str, str]:
+             require_vision: bool = False, trace: list | None = None) -> tuple[str, str]:
     """Returns (reply text, provider name). Raises ProviderError when every route failed.
     require_vision: the images ARE the work (handwriting), so a text-only model must never answer:
     it would not see the work and would grade it as blank."""
@@ -97,10 +105,15 @@ def complete(system: str, text: str, images: list[str] | None = None, want_out: 
             try:
                 out = _call(r, system, text, images, client)
                 if out.strip():
+                    if trace is not None:
+                        trace.append(f"{r.name}: replied")
                     return out, r.name
                 errors.append(f"{r.name}: empty reply")
             except Exception as e:  # rate limit, outage, bad model name: try the next route
-                errors.append(f"{r.name}: {type(e).__name__} {str(e)[:120]}")
+                code = getattr(getattr(e, "response", None), "status_code", "")
+                errors.append(f"{r.name}: {type(e).__name__} {code} {str(e)[:120]}")
+            if trace is not None:
+                trace.append(errors[-1][:90])      # model + error only, never any student content
         raise ProviderError("all providers failed: " + "; ".join(errors))
     finally:
         if own:

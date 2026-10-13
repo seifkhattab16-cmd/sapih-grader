@@ -145,9 +145,10 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
 
     # 3. One AI call; ask once more with a stricter reminder if the reply is not valid JSON.
     last_err = ""
+    trace: list[str] = []
     for attempt in range(2):
         text, via = complete(SYSTEM, prompt + (f"\n\nYour last reply was invalid ({last_err}). JSON only." if attempt else ""),
-                             images, want_out=3000, require_vision=handwritten)
+                             images, want_out=3000, require_vision=handwritten, trace=trace)
         try:
             res = parse_reply(text)
             break
@@ -157,7 +158,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         return Outcome(status="needs_teacher", note=f"bad_ai_reply: {last_err}", flags=["bad_ai_reply"])
 
     if all(not q.legible for q in res.questions):   # the model could not read any of it: a 0 here would be a lie
-        return Outcome(status="needs_teacher", note="unreadable_work: the AI could not read the work. Not graded.",
+        return Outcome(status="needs_teacher", note="unreadable_work: the AI could not read the work. Not graded. Tried: "
+                       + "; ".join(trace)[:300],
                        flags=["unreadable_work"], via=via)
     flags = []
     if any(not q.legible for q in res.questions):
