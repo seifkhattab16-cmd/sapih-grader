@@ -138,7 +138,10 @@ MARK_SYSTEM = (
     "copy of characters from the transcription. If you cannot copy evidence, do not award the mark. (2) No benefit of "
     "the doubt, no 'follow-through', no 'implied' working unless the mark scheme line itself says so. (3) 'Both "
     "required' means both. A wrong sign or a leftover term is wrong. (4) An empty transcription scores 0. "
-    "(5) Never invent working the student did not write. Reply with ONLY one JSON object, no prose."
+    "(5) Never invent working the student did not write. (6) A method mark (M) is earned when the correct result of "
+    "that method is present in the student's lines (e.g. 12x^2 appearing earns 'reduces a power by one'); do not ask "
+    "for an extra visible step unless the scheme line says 'show'. Wrong or missing results still earn nothing. "
+    "Reply with ONLY one JSON object, no prose."
 )
 MARK_SCHEMA = (
     '{"questions":[{"ref":"1a","max_marks":<int>,"awarded_marks":<int 0..max_marks>,'
@@ -335,7 +338,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     if res.overall_confidence < LOW_CONFIDENCE or any(q.confidence < LOW_CONFIDENCE for q in res.questions):
         flags.append("low_confidence")
     total_max = sum(q.max_marks for q in res.questions)
+    note = "; ".join(trace)[:400]              # which models were tried and which failed (no student content)
     conf = min([res.overall_confidence] + [q.confidence for q in res.questions])
     return Outcome(status="graded", total_awarded=sum(q.awarded_marks for q in res.questions), total_max=total_max,
-                   confidence=max(0.0, min(1.0, conf)), questions=[q.model_dump() for q in res.questions],
+                   confidence=max(0.0, min(1.0, conf)), questions=[q.model_dump() for q in res.questions], note=note,
                    flags=list(dict.fromkeys(flags)), via=" + ".join(via_all))

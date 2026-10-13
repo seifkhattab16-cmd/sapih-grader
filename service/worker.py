@@ -26,7 +26,7 @@ def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Ca
         out = grader_core.grade_submission(assignment, sub.get("data") or {}, fetch, complete)
         if out.status == "graded":
             store.save_grade(job, sub, out)
-            store.finish(job["id"], "done", ",".join(out.flags))
+            store.finish(job["id"], "done", (",".join(out.flags) + " | " + out.note)[:500])
         else:
             store.finish(job["id"], "needs_teacher", out.note)
     except ProviderError as e:      # providers busy or rate-limited: put it back, try later (attempt counted)
