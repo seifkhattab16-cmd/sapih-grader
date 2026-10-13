@@ -71,13 +71,13 @@ def _call(route: Route, system: str, text: str, images: list[str], client: httpx
         content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in imgs]
         content.append({"type": "text", "text": text})
         r = client.post(route.url, headers={"x-api-key": route.key, "anthropic-version": "2023-06-01"},
-                        json={"model": route.model, "max_tokens": route.max_out, "system": system,
+                        json={"model": route.model, "max_tokens": route.max_out, "system": system, "temperature": 0,
                               "messages": [{"role": "user", "content": content}]})
         r.raise_for_status()
         return "".join(b.get("text", "") for b in r.json().get("content", []))
     content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}} for b in imgs]
     content.append({"type": "text", "text": text})
-    body = {"model": route.model, route.out_param: route.max_out, **route.extra,
+    body = {"model": route.model, route.out_param: route.max_out, "temperature": 0, **route.extra,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": content if imgs else text}]}
     r = client.post(route.url, headers={"Authorization": f"Bearer {route.key}", **route.headers}, json=body)
@@ -87,7 +87,7 @@ def _call(route: Route, system: str, text: str, images: list[str], client: httpx
 
 def complete(system: str, text: str, images: list[str] | None = None, want_out: int = 3000,
              routes: list[Route] | None = None, client: httpx.Client | None = None,
-             require_vision: bool = False, trace: list | None = None) -> tuple[str, str]:
+             require_vision: bool = False, trace: list | None = None, skip: list | None = None) -> tuple[str, str]:
     """Returns (reply text, provider name). Raises ProviderError when every route failed.
     require_vision: the images ARE the work (handwriting), so a text-only model must never answer:
     it would not see the work and would grade it as blank."""
@@ -95,6 +95,8 @@ def complete(system: str, text: str, images: list[str] | None = None, want_out: 
     routes = routes if routes is not None else build_routes(bool(images), want_out)
     if require_vision and images:
         routes = [r for r in routes if r.max_images > 0]
+    if skip:
+        routes = [r for r in routes if r.name not in skip]
     if not routes:
         raise ProviderError("no AI provider key is set")
     own = client is None
