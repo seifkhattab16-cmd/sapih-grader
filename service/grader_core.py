@@ -90,6 +90,25 @@ def parse_reply(text: str) -> GradeResult:
     return res
 
 
+def _weight(mark_type: str) -> int:
+    """M1/A1/B1 are worth 1, M2/A2 are worth 2 (the digit in the mark type)."""
+    m = re.search(r"\d+", mark_type or "")
+    return int(m.group()) if m else 1
+
+
+def reconcile(q: QuestionGrade) -> bool:
+    """The model sometimes lists the marks it awarded and then states a different total (seen in testing:
+    two marks ticked, total given as 1). When the listed marks add up to the question's maximum, the ticks
+    are the evidence: recompute the total from them. Returns True if it changed the total."""
+    if not q.marks or sum(_weight(m.type) for m in q.marks) != q.max_marks:
+        return False
+    derived = sum(_weight(m.type) for m in q.marks if m.awarded)
+    if derived == q.awarded_marks:
+        return False
+    q.awarded_marks = derived
+    return True
+
+
 def _read_url(url: str, fetch: Callable[[str], bytes], **kw) -> Material:
     if not url or not isinstance(url, str) or not url.startswith("https://"):
         return Material()
@@ -162,6 +181,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                        + "; ".join(trace)[:300],
                        flags=["unreadable_work"], via=via)
     flags = []
+    if any([reconcile(q) for q in res.questions]):
+        flags.append("marks_recomputed")
     if any(not q.legible for q in res.questions):
         flags.append("unreadable_part")
     if res.overall_confidence < LOW_CONFIDENCE or any(q.confidence < LOW_CONFIDENCE for q in res.questions):

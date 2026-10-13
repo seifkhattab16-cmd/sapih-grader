@@ -138,3 +138,21 @@ def test_all_illegible_goes_to_teacher_not_zero():
     bad = json.loads(json.dumps(GOOD)); bad["questions"][0]["legible"] = False
     out = grader_core.grade_submission(ASSIGN, SUB, fetch, lambda s, t, i, want_out=3000, **kw: (json.dumps(bad), "f"))
     assert out.status == "needs_teacher" and "unreadable_work" in out.flags
+
+
+def test_total_recomputed_from_ticked_marks():
+    bad = json.loads(json.dumps(GOOD))
+    q = bad["questions"][0]
+    q["max_marks"] = 3
+    q["marks"] = [{"type": "M1", "awarded": True}, {"type": "A1", "awarded": True}, {"type": "A1", "awarded": False}]
+    q["awarded_marks"] = 1          # model says 1 but ticked 2
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, lambda s, t, i, want_out=3000, **kw: (json.dumps(bad), "f"))
+    assert out.total_awarded == 2 and "marks_recomputed" in out.flags
+
+
+def test_no_recompute_when_marks_do_not_add_to_max():
+    odd = json.loads(json.dumps(GOOD))
+    odd["questions"][0]["marks"] = [{"type": "M1", "awarded": True}]   # 1 listed of 3: incomplete list, keep model total
+    odd["questions"][0]["awarded_marks"] = 2
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, lambda s, t, i, want_out=3000, **kw: (json.dumps(odd), "f"))
+    assert out.total_awarded == 2 and "marks_recomputed" not in out.flags
