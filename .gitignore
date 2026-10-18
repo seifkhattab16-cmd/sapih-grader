@@ -1,3 +1,6 @@
 .env
 __pycache__/
 *.pyc
+eval/pages/
+eval/manifest.json
+eval/report.json

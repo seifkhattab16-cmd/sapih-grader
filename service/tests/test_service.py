@@ -201,3 +201,15 @@ def test_worker_provider_outage_requeues():
     def down(*a, **k): raise ProviderError("all down")
     worker.drain(st, fetch=fetch, complete=down)
     assert st.status[0] == "queued"
+
+
+def test_eval_harness_summarises_agreement_per_type(tmp_path):
+    from service import eval_harness as eh
+    (tmp_path / "w01.png").write_bytes(pdf("x"))                 # any readable bytes; the Fake never looks at them
+    it = {"id": "w01", "type": "working", "page": "w01.png", "scheme": "Q1 (2 marks): M1, A1", "teacher_marks": {"1": 2}}
+    r = eh.run_item(it, tmp_path, Fake())
+    assert r["status"] == "graded" and r["rows"] == [{"ref": "1", "teacher": 2, "ai": 2, "max": 2}]
+    r2 = {**r, "type": "proof", "rows": [{"ref": "1", "teacher": 1, "ai": 2, "max": 2}, {"ref": "2", "teacher": 2, "ai": None, "max": None}]}
+    s = eh.summarise([r, r2])
+    assert s["working"]["exact_pct"] == 100 and s["working"]["passes_bar"]
+    assert s["proof"]["over"] == 1 and s["proof"]["under"] == 1 and not s["proof"]["passes_bar"]
