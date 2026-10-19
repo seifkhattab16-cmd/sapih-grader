@@ -50,10 +50,56 @@ class Store:
                      json={"status": status, "note": note[:500], "updated_at": _now()}).raise_for_status()
 
     def get_submission(self, kind: str, sid: str) -> dict | None:
+        if kind == "class_question":
+            return self._class_question_answer(sid)
         table = "submissions" if kind == "submission" else "quiz_submissions"
         r = self.c.get(self._u(table), headers=self._h(), params={"id": f"eq.{sid}", "limit": "1"})
         r.raise_for_status()
+        row = (r.json() or [None])[0]
+        if row and kind == "quiz":
+            row["_quiz"] = self._quiz_paper(row)
+        return row
+
+    def _one(self, table: str, **eq) -> dict | None:
+        r = self.c.get(self._u(table), headers=self._h(), params={**{k: f"eq.{v}" for k, v in eq.items()}, "limit": "1"})
+        r.raise_for_status()
         return (r.json() or [None])[0]
+
+    def _quiz_paper(self, sub: dict) -> dict:
+        """The paper this student sat, with the bank's mark scheme and model answer for each question.
+        A versioned quiz keeps each student's own questions in exam_versions (the quiz row has none)."""
+        quiz = self._one("quizzes", id=sub.get("quiz_id")) or {}
+        qd = quiz.get("data") or {}
+        ver = self._one("exam_versions", quiz_id=sub.get("quiz_id"), student_uid=sub.get("student_uid"))
+        questions = (ver or {}).get("questions") or qd.get("questions") or []
+        ids = [q["qbId"] for q in questions if q.get("qbId")]
+        bank = {}
+        if ids:
+            r = self.c.get(self._u("question_bank"), headers=self._h(), params={
+                "id": f"in.({','.join(ids)})", "select": "id,stem,marks,mark_scheme,model_answer"})
+            r.raise_for_status()
+            bank = {b["id"]: b for b in r.json()}
+        return {"title": qd.get("title") or "Quiz", "type": qd.get("type"), "versioned": bool(ver) or bool(qd.get("versioned")),
+                "has_version": bool(ver), "questions": questions, "bank": bank}
+
+    def _class_question_answer(self, sid: str) -> dict | None:
+        """A class-question answer shaped like a submission row (data.fileUrl / data.text), plus the question
+        and its solution under `_cq` so the worker can build the mark scheme."""
+        r = self.c.get(self._u("class_question_answers"), headers=self._h(), params={"id": f"eq.{sid}", "limit": "1"})
+        r.raise_for_status()
+        a = (r.json() or [None])[0]
+        if not a:
+            return None
+        q = self.c.get(self._u("class_questions"), headers=self._h(), params={"id": f"eq.{a['class_question_id']}", "limit": "1"})
+        q.raise_for_status()
+        q = (q.json() or [None])[0] or {}
+        s = self.c.get(self._u("class_question_solutions"), headers=self._h(),
+                       params={"class_question_id": f"eq.{a['class_question_id']}", "limit": "1"})
+        s.raise_for_status()
+        s = (s.json() or [{}])[0]
+        return {"id": a["id"], "course_id": q.get("course_id"), "assignment_id": None, "student_uid": a["student_uid"],
+                "data": {"fileUrl": a.get("photo_url") or "", "text": a.get("answer_text") or ""},
+                "_cq": {"question": q, "solution": s}}
 
     def get_assignment(self, aid: str | None) -> dict | None:
         if not aid:

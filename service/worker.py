@@ -1,5 +1,6 @@
 """Drains the grading queue: claim a job, grade it, store the draft. Safe to call often and from anywhere."""
 from __future__ import annotations
+import json
 import logging
 from typing import Callable
 from . import grader_core
@@ -7,6 +8,43 @@ from .materials import fetch_bytes
 from .providers import ProviderError, complete as default_complete
 
 log = logging.getLogger("grader")
+
+
+def _text(v) -> str:
+    if v in (None, "", [], {}):
+        return ""
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
+def class_question_assignment(cq: dict) -> dict:
+    """The grader reads an 'assignment'; for a class question that is the question, its mark scheme and model answer."""
+    q, s = cq.get("question") or {}, cq.get("solution") or {}
+    return {"title": "Class question", "description": q.get("stem") or "",
+            "markingSchemeNotes": _text(s.get("mark_scheme")), "modelAnswerNotes": _text(s.get("model_answer"))}
+
+
+def quiz_assignment(paper: dict) -> dict | None:
+    """The grader reads an 'assignment'; for a bank quiz that is this student's own questions, numbered 1, 2, ...,
+    with each one's mark scheme and model answer from the bank. None when no question has a typed mark scheme."""
+    desc, ms, ma, have = [], [], [], 0
+    for i, q in enumerate(paper.get("questions") or [], 1):
+        b = (paper.get("bank") or {}).get(q.get("qbId")) or {}
+        marks = q.get("marks") or b.get("marks")
+        desc.append(f"Question {i}" + (f" [{marks} marks]" if marks else "") + ": "
+                    + (q.get("stem") or b.get("stem") or "(shown as a picture)"))
+        scheme = _text(b.get("mark_scheme"))
+        if scheme:
+            have += 1
+            ms.append(f"Question {i}: {scheme}")
+        else:
+            ms.append(f"Question {i}: (no typed mark scheme: do not mark this question, leave it for the teacher)")
+        if _text(b.get("model_answer")):
+            ma.append(f"Question {i}: {_text(b.get('model_answer'))}")
+    if not have:
+        return None
+    sep = chr(10)
+    return {"title": paper.get("title") or "Quiz", "description": sep.join(desc),
+            "markingSchemeNotes": sep.join(ms), "modelAnswerNotes": sep.join(ma)}
 
 
 def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Callable = default_complete) -> bool:
@@ -19,10 +57,19 @@ def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Ca
         if not sub:
             store.finish(job["id"], "failed", "submission no longer exists")
             return True
-        assignment = (store.get_assignment(sub.get("assignment_id")) or {}).get("data", {}) if job["kind"] == "submission" else {}
-        if job["kind"] != "submission":
-            store.finish(job["id"], "needs_teacher", "quiz grading arrives with step 2.5")
-            return True
+        if job["kind"] == "class_question":
+            assignment = class_question_assignment(sub["_cq"])
+        elif job["kind"] == "submission":
+            assignment = (store.get_assignment(sub.get("assignment_id")) or {}).get("data", {})
+        else:
+            paper = sub.get("_quiz") or {}
+            if paper.get("versioned") and not paper.get("has_version"):
+                store.finish(job["id"], "needs_teacher", "no_paper: versioned quiz but this student has no version row")
+                return True
+            assignment = quiz_assignment(paper) if paper.get("type") == "bank" else None
+            if not assignment:
+                store.finish(job["id"], "needs_teacher", "no_scheme: not a bank quiz, or no question has a typed mark scheme")
+                return True
         out = grader_core.grade_submission(assignment, sub.get("data") or {}, fetch, complete)
         if out.status == "graded":
             store.save_grade(job, sub, out)

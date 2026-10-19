@@ -213,3 +213,49 @@ def test_eval_harness_summarises_agreement_per_type(tmp_path):
     s = eh.summarise([r, r2])
     assert s["working"]["exact_pct"] == 100 and s["working"]["passes_bar"]
     assert s["proof"]["over"] == 1 and s["proof"]["under"] == 1 and not s["proof"]["passes_bar"]
+
+
+def test_class_question_photo_is_graded_against_the_solution():
+    st = FakeStore(kind="class_question")
+    st.get_submission = lambda k, i: {"course_id": "c", "assignment_id": None, "student_uid": "u", "data": SUB,
+                                      "_cq": {"question": {"stem": "Solve x^2-4=0"},
+                                              "solution": {"mark_scheme": [{"ref": "1", "marks": "M1 A1"}], "model_answer": []}}}
+    f = Fake()
+    assert worker.drain(st, fetch=fetch, complete=f) == 1
+    assert st.status[0] == "done" and st.saved.total_awarded == 2
+
+
+def test_class_question_assignment_carries_scheme_and_answer():
+    a = worker.class_question_assignment({"question": {"stem": "Q"}, "solution": {"mark_scheme": ["M1"], "model_answer": []}})
+    assert a["markingSchemeNotes"] == '["M1"]' and a["modelAnswerNotes"] == "" and a["description"] == "Q"
+
+
+def _paper(**kw):
+    p = {"title": "Mock", "type": "bank", "versioned": True, "has_version": True,
+         "questions": [{"qbId": "a", "marks": 2, "stem": "Solve x^2-4=0"}, {"qbId": "b", "marks": 1, "stem": "Expand"}],
+         "bank": {"a": {"mark_scheme": [{"ref": "1", "marks": "M1 A1"}], "model_answer": ["x=2"]},
+                  "b": {"mark_scheme": [], "model_answer": []}}}
+    p.update(kw)
+    return p
+
+
+def test_quiz_assignment_uses_the_students_own_questions_and_skips_missing_schemes():
+    a = worker.quiz_assignment(_paper())
+    assert "Question 1 [2 marks]: Solve x^2-4=0" in a["description"]
+    assert "Question 2: (no typed mark scheme" in a["markingSchemeNotes"] and "Question 1: " in a["modelAnswerNotes"]
+    assert worker.quiz_assignment(_paper(bank={})) is None
+
+
+def test_quiz_job_is_graded_from_the_students_version():
+    st = FakeStore(kind="quiz")
+    st.get_submission = lambda k, i: {"course_id": "c", "quiz_id": "q", "student_uid": "u", "data": SUB, "_quiz": _paper()}
+    assert worker.drain(st, fetch=fetch, complete=Fake()) == 1
+    assert st.status[0] == "done" and st.saved.total_awarded == 2
+
+
+def test_quiz_job_without_a_version_or_scheme_goes_to_the_teacher():
+    for paper in (_paper(has_version=False), _paper(type="pdf"), _paper(bank={})):
+        st = FakeStore(kind="quiz")
+        st.get_submission = lambda k, i, p=paper: {"course_id": "c", "quiz_id": "q", "student_uid": "u", "data": SUB, "_quiz": p}
+        assert worker.drain(st, fetch=fetch, complete=Fake()) == 1
+        assert st.status[0] == "needs_teacher" and st.saved is None
