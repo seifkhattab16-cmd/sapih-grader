@@ -1,0 +1,12 @@
+[
+ {"id": "t01", "q": "pp_wst01_01_2025_may_q01", "part": "(a)", "student": "0.85", "expected": 1, "note": "right, answer only"},
+ {"id": "t02", "q": "pp_wst01_01_2025_may_q01", "part": "(a)", "student": "F(3.5) = P(X < 3.5) = 0.3 + 0.2 + 0.35 = 0.85", "expected": 1, "note": "right with method"},
+ {"id": "t03", "q": "pp_wst01_01_2025_may_q01", "part": "(a)", "student": "0.65", "expected": 0, "note": "forgot the 3.5 includes 3"},
+ {"id": "t04", "q": "pp_wst01_01_2025_may_q01", "part": "(c)", "student": "E(X) = 1x0.3 + 2x0.2 + 3x0.35 + 4x0.15 = 0.3+0.4+1.05+0.6 = 2.35", "expected": 2, "note": "full working"},
+ {"id": "t05", "q": "pp_wst01_01_2025_may_q01", "part": "(c)", "student": "2.35", "expected": 2, "note": "correct answer alone scores full marks"},
+ {"id": "t06", "q": "pp_wst01_01_2025_may_q01", "part": "(c)", "student": "E(X) = 1x0.3 + 2x0.2 + 3x0.35 + 4x0.15 = 0.3+0.4+1.05+0.6 = 2.5", "expected": 1, "note": "right method, addition slip"},
+ {"id": "t07", "q": "pp_wst01_01_2025_may_q01", "part": "(c)", "student": "(1+2+3+4)/4 = 2.5", "expected": 0, "note": "ignores the probabilities"},
+ {"id": "t08", "q": "pp_wst01_01_2025_may_q01", "part": "(b)", "student": "3X-3 < X+2 so 2X < 5, X < 2.5, so P = 0.3 + 0.2 = 0.5", "expected": 2, "note": "full"},
+ {"id": "t09", "q": "pp_wst01_01_2025_may_q01", "part": "(b)", "student": "3X-3 < X+2 so X < 2.5. P(X < 2.5) = 0.85", "expected": 1, "note": "inequality right, probability wrong"},
+ {"id": "t10", "q": "pp_wst01_01_2025_may_q01", "part": "(e)", "student": "", "expected": 0, "note": "blank: must not be graded from the question or a file name"}
+]

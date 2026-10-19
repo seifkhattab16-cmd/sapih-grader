@@ -16,6 +16,24 @@ def _text(v) -> str:
     return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
 
 
+def scheme_from_model_answer(model_answer) -> str:
+    """S1 / past-paper bank rows keep their official mark scheme as a picture (mark_scheme is empty) but carry a typed
+    worked solution whose parts list the marks (M1 A1 ...), written from and checked against that mark scheme (S3.1).
+    Turn it into mark-scheme lines so the grader can mark those questions. Empty when it is not that shape."""
+    if not isinstance(model_answer, list):
+        return ""
+    lines = []
+    for st in model_answer:
+        if not isinstance(st, dict) or not str(st.get("marks") or "").strip():
+            continue
+        part = str(st.get("part") or "").strip()
+        work = " ".join(str(st.get("working") or "").split())[:700]
+        tip = str(st.get("tip") or "").strip()
+        lines.append(f"{part or 'whole question'} [{st['marks']}]: final answer {st.get('answer') or '?'}. Method: {work}"
+                     + (f" Examiner notes: {tip}" if tip else ""))
+    return "\n".join(lines)
+
+
 def class_question_assignment(cq: dict) -> dict:
     """The grader reads an 'assignment'; for a class question that is the question, its mark scheme and model answer."""
     q, s = cq.get("question") or {}, cq.get("solution") or {}
@@ -30,9 +48,10 @@ def quiz_assignment(paper: dict) -> dict | None:
     for i, q in enumerate(paper.get("questions") or [], 1):
         b = (paper.get("bank") or {}).get(q.get("qbId")) or {}
         marks = q.get("marks") or b.get("marks")
+        image_only = bool((b.get("data") or {}).get("image_only"))     # past-paper row: the stem text is unreliable OCR
         desc.append(f"Question {i}" + (f" [{marks} marks]" if marks else "") + ": "
-                    + (q.get("stem") or b.get("stem") or "(shown as a picture)"))
-        scheme = _text(b.get("mark_scheme"))
+                    + ("(shown as a picture)" if image_only else (q.get("stem") or b.get("stem") or "(shown as a picture)")))
+        scheme = _text(b.get("mark_scheme")) or scheme_from_model_answer(b.get("model_answer"))
         if scheme:
             have += 1
             ms.append(f"Question {i}: {scheme}")

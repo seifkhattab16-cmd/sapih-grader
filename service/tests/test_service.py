@@ -259,3 +259,34 @@ def test_quiz_job_without_a_version_or_scheme_goes_to_the_teacher():
         st.get_submission = lambda k, i, p=paper: {"course_id": "c", "quiz_id": "q", "student_uid": "u", "data": SUB, "_quiz": p}
         assert worker.drain(st, fetch=fetch, complete=Fake()) == 1
         assert st.status[0] == "needs_teacher" and st.saved is None
+
+
+# ---- S1 / past-paper bank rows: the mark scheme is a picture, the typed worked solution carries the marks ----
+S1_ANSWER = [{"part": "(a)", "working": "Let $X\sim N(40,2.4^2)$. $P(X<37)=P(Z<-1.25)=0.1056$", "answer": "0.106", "marks": "M1 M1 A1",
+              "tip": "Tables give 0.1056."},
+             {"part": "(b)", "working": "z = 0.2533 so m = 31.4", "answer": "m=31.4", "marks": "M1 B1 A1"}]
+
+
+def test_scheme_from_model_answer_lists_parts_marks_answers_and_tips():
+    t = worker.scheme_from_model_answer(S1_ANSWER)
+    assert "(a) [M1 M1 A1]: final answer 0.106" in t and "(b) [M1 B1 A1]: final answer m=31.4" in t and "Tables give 0.1056" in t
+    assert worker.scheme_from_model_answer([]) == "" and worker.scheme_from_model_answer(None) == ""
+    assert worker.scheme_from_model_answer([{"working": "words only", "answer": "x"}]) == ""      # no marks listed: not a scheme
+
+
+def test_image_only_past_paper_question_is_markable_and_its_ocr_stem_is_not_shown():
+    paper = _paper(questions=[{"qbId": "pp", "marks": 6, "stem": "garbled \x01 OCR text"}],
+                   bank={"pp": {"stem": "garbled \x01 OCR text", "marks": 6, "mark_scheme": [], "model_answer": S1_ANSWER,
+                                "data": {"image_only": True}}})
+    a = worker.quiz_assignment(paper)
+    assert a is not None and "(shown as a picture)" in a["description"] and "garbled" not in a["description"]
+    assert "[M1 M1 A1]" in a["markingSchemeNotes"] and "no typed mark scheme" not in a["markingSchemeNotes"]
+
+
+def test_typed_mark_scheme_still_wins_and_a_row_with_neither_is_left_to_the_teacher():
+    paper = _paper(questions=[{"qbId": "ai", "marks": 2}, {"qbId": "none", "marks": 3}],
+                   bank={"ai": {"stem": "AI question", "marks": 2, "mark_scheme": [{"ref": "1", "marks": "B1 B1"}], "model_answer": S1_ANSWER, "data": {"ai_generated": True}},
+                         "none": {"stem": "x", "marks": 3, "mark_scheme": [], "model_answer": [], "data": {"image_only": True}}})
+    a = worker.quiz_assignment(paper)
+    assert "AI question" in a["description"] and '"marks": "B1 B1"' in a["markingSchemeNotes"].replace("'", '"')
+    assert "Question 2: (no typed mark scheme" in a["markingSchemeNotes"]

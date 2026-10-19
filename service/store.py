@@ -76,7 +76,7 @@ class Store:
         bank = {}
         if ids:
             r = self.c.get(self._u("question_bank"), headers=self._h(), params={
-                "id": f"in.({','.join(ids)})", "select": "id,stem,marks,mark_scheme,model_answer"})
+                "id": f"in.({','.join(ids)})", "select": "id,stem,marks,mark_scheme,model_answer,data"})
             r.raise_for_status()
             bank = {b["id"]: b for b in r.json()}
         return {"title": qd.get("title") or "Quiz", "type": qd.get("type"), "versioned": bool(ver) or bool(qd.get("versioned")),
