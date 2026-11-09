@@ -290,3 +290,50 @@ def test_typed_mark_scheme_still_wins_and_a_row_with_neither_is_left_to_the_teac
     a = worker.quiz_assignment(paper)
     assert "AI question" in a["description"] and '"marks": "B1 B1"' in a["markingSchemeNotes"].replace("'", '"')
     assert "Question 2: (no typed mark scheme" in a["markingSchemeNotes"]
+
+
+# ── Private uploads (portal P0.3): "storage://uploads/<path>" is read through the Storage API with the service key ──
+def test_private_upload_is_read_like_a_link():
+    ref = "storage://uploads/c/aaaa/s/bbbb/work.pdf"
+    FILES[ref] = FILES["https://f/work.pdf"]
+    try:
+        m = grader_core._read_url(ref, fetch, always_images=True)
+        assert m.readable and m.images
+    finally:
+        del FILES[ref]
+
+
+def test_fetch_bytes_signs_storage_requests_with_the_service_key(monkeypatch):
+    import httpx
+    from service import materials
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co/")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "sekret")
+    seen = {}
+
+    def handler(req):
+        seen["url"], seen["auth"], seen["apikey"] = str(req.url), req.headers.get("authorization"), req.headers.get("apikey")
+        return httpx.Response(200, content=b"%PDF-1.4 x")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert materials.fetch_bytes("storage://uploads/c/a b/s/u/1-work.pdf", client) == b"%PDF-1.4 x"
+    assert seen["url"] == "https://proj.supabase.co/storage/v1/object/authenticated/uploads/c/a%20b/s/u/1-work.pdf"
+    assert seen["auth"] == "Bearer sekret" and seen["apikey"] == "sekret"
+
+
+def test_fetch_bytes_sends_no_key_to_web_links(monkeypatch):
+    import httpx
+    from service import materials
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "sekret")
+    seen = {}
+    with httpx.Client(transport=httpx.MockTransport(lambda r: (seen.setdefault("auth", r.headers.get("authorization")), httpx.Response(200, content=b"x"))[1])) as client:
+        materials.fetch_bytes("https://res.cloudinary.com/x/work.pdf", client)
+    assert seen["auth"] is None
+
+
+@pytest.mark.parametrize("bad", ["storage://uploads", "storage://uploads/../secret", "http://plain/work.pdf", "ftp://x/y"])
+def test_fetch_bytes_refuses_bad_references(monkeypatch, bad):
+    from service import materials
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "sekret")
+    with pytest.raises(ValueError):
+        materials.fetch_bytes(bad)

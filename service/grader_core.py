@@ -12,7 +12,7 @@ import re
 from typing import Callable, Optional
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from . import config as C
-from .materials import Material, read_document
+from .materials import Material, read_document, is_file_ref
 from .providers import complete as default_complete
 
 LOW_CONFIDENCE = 0.6
@@ -111,7 +111,7 @@ def reconcile(q: QuestionGrade) -> bool:
 
 
 def _read_url(url: str, fetch: Callable[[str], bytes], **kw) -> Material:
-    if not url or not isinstance(url, str) or not url.startswith("https://"):
+    if not is_file_ref(url):
         return Material()
     try:
         return read_document(fetch(url), url.split("?")[0].rsplit("/", 1)[-1], **kw)

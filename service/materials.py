@@ -2,6 +2,7 @@
 A file name or title is never used as work: if nothing readable comes out, the caller must not grade."""
 from __future__ import annotations
 import base64
+from urllib.parse import quote
 from dataclasses import dataclass, field
 import httpx
 import pymupdf
@@ -21,13 +22,37 @@ class Material:
         return bool(self.text.strip()) or bool(self.images)
 
 
+STORED = "storage://"   # private uploads (portal P0.3): "storage://uploads/<path>", read with the service key
+
+
+def is_file_ref(url) -> bool:
+    """A web link or a private-bucket reference: something fetch_bytes can read."""
+    return isinstance(url, str) and (url.startswith("https://") or url.startswith(STORED))
+
+
+def storage_request(ref: str) -> tuple[str, dict]:
+    """The Storage API address and headers for "storage://<bucket>/<path>". The key is only ever sent to our own
+    Supabase project; httpx drops the Authorization header if a redirect leaves that host."""
+    bucket_path = ref[len(STORED):]
+    if "/" not in bucket_path or ".." in bucket_path.split("/"):
+        raise ValueError("bad storage reference")
+    base, key = C.supabase_url(), C.supabase_key()
+    if not base.startswith("https://") or not key:
+        raise ValueError("private file, but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set")
+    return (f"{base}/storage/v1/object/authenticated/{quote(bucket_path, safe='/')}",
+            {"Authorization": f"Bearer {key}", "apikey": key})
+
+
 def fetch_bytes(url: str, client: httpx.Client | None = None) -> bytes:
-    if not url.startswith("https://"):
-        raise ValueError("only https file links are fetched")
+    if not is_file_ref(url):
+        raise ValueError("only https file links and private uploads are fetched")
+    headers = {}
+    if url.startswith(STORED):
+        url, headers = storage_request(url)
     own = client is None
     client = client or httpx.Client(timeout=60, follow_redirects=True)
     try:
-        r = client.get(url)
+        r = client.get(url, headers=headers)
         r.raise_for_status()
         if len(r.content) > MAX_BYTES:
             raise ValueError("file too large")
