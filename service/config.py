@@ -31,7 +31,12 @@ def route_order() -> list[str]:
 
 
 MAX_ATTEMPTS = 3
-MAX_PAGES_STUDENT = 6        # page images sent for the student's work
-MAX_PAGES_REFERENCE = 3      # page images sent per reference document (QP / MS / MA) when it is a scan
+MAX_PAGES_STUDENT = 24       # pages of the student's work read, one page per transcription call (a vision route may
+                             # take only one image: Groq's does), written pages first when the blank paper is known
+MAX_PAGES_REFERENCE = 3      # page images sent per reference document (QP / MS / MA) when it is a short scan
+MAX_PAGES_REFERENCE_COPY = 30  # a longer scanned mark scheme / model answer is copied to text, one page per call
+WRITTEN_PAGE_MARGIN = 0.3    # a page is "written on" when it differs from the blank paper this much more than a
+                             # typical untouched page does (mean grey-level difference, 0-255, at 160 px wide)
+RUN_BUDGET_SECONDS = 480     # the Action stops after 12 minutes: take no new job after 8
 MIN_TEXT_PER_PAGE = 40       # fewer characters than this per page = a scan, send images instead
 MAX_TEACHER_EXAMPLES = 6     # 3.6: the teacher's corrected questions on the same work, shown to the marker as examples

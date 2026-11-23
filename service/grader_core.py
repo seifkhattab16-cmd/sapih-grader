@@ -12,7 +12,7 @@ import re
 from typing import Callable, Optional
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from . import config as C
-from .materials import Material, read_document, is_file_ref
+from .materials import Material, read_document, is_file_ref, written_pages
 from .providers import complete as default_complete
 
 LOW_CONFIDENCE = 0.6
@@ -153,13 +153,40 @@ def reconcile(q: QuestionGrade) -> bool:
     return True
 
 
-def _read_url(url: str, fetch: Callable[[str], bytes], **kw) -> Material:
+def _fetch(url: str, fetch: Callable[[str], bytes]) -> bytes | None:
     if not is_file_ref(url):
-        return Material()
+        return None
     try:
-        return read_document(fetch(url), url.split("?")[0].rsplit("/", 1)[-1], **kw)
+        return fetch(url)
     except Exception:
-        return Material()
+        return None
+
+
+def _name(url: str) -> str:
+    return url.split("?")[0].rsplit("/", 1)[-1]
+
+
+def _read_url(url: str, fetch: Callable[[str], bytes], **kw) -> Material:
+    data = _fetch(url, fetch)
+    return read_document(data, _name(url), **kw) if data is not None else Material()
+
+
+def _student_work(url: str, fetch: Callable[[str], bytes], blank: bytes | None) -> tuple[Material, bool, str]:
+    """The student's file as page images, plus (matched, note). A file that is the assignment's own paper with the
+    student's writing on it (a practice book) is compared page by page with the blank paper, and only the pages the
+    student wrote on are read (matched=True). Otherwise the pages are read in order. At most C.MAX_PAGES_STUDENT."""
+    data = _fetch(url, fetch)
+    if data is None:
+        return Material(), False, ""
+    pages = written_pages(data, blank) if blank else None
+    if pages is None:
+        return read_document(data, _name(url), max_images=C.MAX_PAGES_STUDENT, always_images=True), False, ""
+    if not pages:
+        return Material(), True, "no_writing: the file is the blank paper, with nothing written on it. Not graded."
+    note = f"read pages {','.join(str(i + 1) for i in pages[:C.MAX_PAGES_STUDENT])} (written on)"
+    if len(pages) > C.MAX_PAGES_STUDENT:
+        note += f"; {len(pages) - C.MAX_PAGES_STUDENT} more written page(s) not read"
+    return read_document(data, _name(url), max_images=C.MAX_PAGES_STUDENT, always_images=True, pages=pages), True, note
 
 
 def _note(v) -> str:
@@ -326,13 +353,78 @@ def _ask(complete, system, prompt, images, parse, trace, require_vision=False, s
     raise ValueError(last)
 
 
-def _parse_transcription(text: str) -> list[dict]:
+def _parse_transcription(text: str, allow_empty: bool = False) -> list[dict]:
     qs = _json_obj(text).get("questions")
-    if not isinstance(qs, list) or not qs:
+    if not isinstance(qs, list) or (not qs and not allow_empty):
         raise ValueError("no questions in transcription")
     return [{"ref": str(q.get("ref", "?")), "transcription": str(q.get("transcription") or "").strip(),
              "sketch": str(q.get("sketch") or "").strip(),
              "legible": bool(q.get("legible", True))} for q in qs if isinstance(q, dict)]
+
+
+def _parse_page(text: str) -> list[dict]:
+    """One page of a multi-page file: a page with nothing written by the student is an empty list, not an error."""
+    return _parse_transcription(text, allow_empty=True)
+
+
+def merge_transcripts(pages: list[list[dict]]) -> list[dict]:
+    """Joins per-page transcriptions: one entry per question, in first-seen order; a question that runs over two pages
+    keeps both parts (in page order); it is legible only if every part was."""
+    out: dict[str, dict] = {}
+    for page in pages:
+        for t in page:
+            ref = re.sub(r"\s+", "", t["ref"]) or "?"
+            if ref not in out:
+                out[ref] = {**t, "ref": ref}
+                continue
+            o = out[ref]
+            o["transcription"] = "\n".join(x for x in (o["transcription"], t["transcription"]) if x)
+            o["sketch"] = "\n".join(x for x in (o.get("sketch", ""), t.get("sketch", "")) if x)
+            o["legible"] = o["legible"] and t["legible"]
+    return list(out.values())
+
+
+COPY_SYSTEM = (
+    "You copy a printed maths document (a worked model answer or a mark scheme) into plain text. For each question on "
+    "the page, copy its number, every part's working and final answer, and every mark label (M1, A1, B1, ...) next to "
+    "the line it belongs to. Copy exactly what is printed: do not solve, correct, shorten or add anything. Skip page "
+    "headers, footers and watermarks. Reply with ONLY one JSON object, no prose."
+)
+COPY_SCHEMA = '{"questions":[{"ref":"5","text":"<everything printed for this question on this page>"}]}'
+_COPIES: dict[str, list[dict]] = {}   # one run copies each long reference once, however many students it marks
+
+
+def _parse_copy(text: str) -> list[dict]:
+    qs = _json_obj(text).get("questions")
+    if not isinstance(qs, list):
+        raise ValueError("no questions in copy")
+    return [{"ref": re.sub(r"\s+", "", str(q.get("ref", "?"))) or "?", "text": str(q.get("text") or "").strip()}
+            for q in qs if isinstance(q, dict) and str(q.get("text") or "").strip()]
+
+
+def copy_reference(key: str, m: Material, complete, trace: list[str]) -> list[dict] | None:
+    """A long scanned mark scheme or model answer, copied to text one page per call (a vision route may take a single
+    image), so the marker can use every page rather than the first few pictures. [{ref, text}] in page order, or None
+    when no page could be copied (the caller then keeps the pictures)."""
+    if key in _COPIES:
+        return _COPIES[key]
+    parts: list[dict] = []
+    for i, img in enumerate(m.images):
+        pno = m.page_numbers[i] if i < len(m.page_numbers) else i + 1
+        try:
+            got, _ = _ask(complete, COPY_SYSTEM, f"Page {pno} of the document. Respond with JSON of this shape:\n"
+                          + COPY_SCHEMA, [img], _parse_copy, trace, require_vision=True)
+        except Exception:
+            continue                                  # one unreadable page must not lose the others
+        parts += got
+    if not parts:
+        return None
+    by: dict[str, dict] = {}
+    for p in parts:                                    # a question that runs over two pages is joined back together
+        by.setdefault(p["ref"], {"ref": p["ref"], "text": ""})
+        by[p["ref"]]["text"] = "\n".join(x for x in (by[p["ref"]]["text"], p["text"]) if x)
+    _COPIES[key] = list(by.values())
+    return _COPIES[key]
 
 
 def _lead(ref: str) -> str:
@@ -373,19 +465,28 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     (2) text models mark from the transcription, twice with different models; every awarded mark must quote the
     transcription, or it is denied."""
     typed = (submission.get("text") or "").strip()
-    work = _read_url(submission.get("fileUrl") or "", fetch, max_images=C.MAX_PAGES_STUDENT, always_images=True)
+    qp_url = assignment.get("fileUrl") or ""
+    qp_bytes = _fetch(qp_url, fetch)
+    work, matched, pages_note = _student_work(submission.get("fileUrl") or "", fetch, qp_bytes)
+    if not typed and pages_note.startswith("no_writing"):
+        return Outcome(status="needs_teacher", note=pages_note, flags=["unreadable_work"])
     if not typed and not work.readable:
         return Outcome(status="needs_teacher", note="unreadable_work: no typed answer, and the file could not be read "
                        "(unsupported type, corrupt, or empty). Not graded.", flags=["unreadable_work"])
 
-    ms = _read_url(assignment.get("markingSchemeUrl") or "", fetch)
-    ma = _read_url(assignment.get("modelAnswerUrl") or "", fetch)
+    # A reference that is a long scan is read in full (copied to text below); a short one is sent as pictures.
+    ref_kw = {"max_images": C.MAX_PAGES_REFERENCE_COPY}
+    ms = _read_url(assignment.get("markingSchemeUrl") or "", fetch, **ref_kw)
+    ma = _read_url(assignment.get("modelAnswerUrl") or "", fetch, **ref_kw)
     ms_notes = _note(assignment.get("markingSchemeNotes")) or _note(assignment.get("markingScheme"))
     ma_notes = _note(assignment.get("modelAnswerNotes")) or _note(assignment.get("modelAnswer"))
     if not (ms.readable or ma.readable or ms_notes or ma_notes):
         return Outcome(status="needs_teacher", note="no_scheme: this assignment has no readable marking scheme or "
                        "model answer. Not graded.", flags=["no_scheme"])
-    qp = _read_url(assignment.get("fileUrl") or "", fetch)
+    # When the student's pages ARE the question paper (matched), each page already shows its questions: no extra
+    # pictures of the paper. Otherwise the paper's first pages go with the work, as before.
+    qp = read_document(qp_bytes, _name(qp_url), max_images=0 if matched else C.MAX_PAGES_REFERENCE) \
+        if qp_bytes is not None else Material()
     # The questions themselves: a quiz lists each student's own questions in `description`; homework may describe
     # them there too, and a printed question paper adds its text layer. (E test, 2026-11-23: without them a "show
     # that" question was marked as plain working.)
@@ -406,7 +507,7 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     transcript: list[dict] = []
 
     # Stage 1: transcribe the uploaded file (vision only). Typed answers need no transcription.
-    if work.images:
+    if len(work.images) == 1:
         p1 = (block("QUESTION PAPER (printed, for the question numbers only)", qp, _note(assignment.get("description")))
               + "\nThe attached images are the student's pages. Transcribe the student's answer to every question "
                 "in the paper."
@@ -419,7 +520,41 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         except ValueError as e:
             return Outcome(status="needs_teacher", note=f"bad_ai_reply: transcription {e}. Tried: " + "; ".join(trace)[:250],
                            flags=["bad_ai_reply"])
-        if all(not t["legible"] for t in transcript):
+    elif work.images:
+        # Several pages: one page per call (a vision route may accept a single image, so a batch would silently lose
+        # every page after the first), then the answers are joined by question.
+        paper = block("QUESTION PAPER (printed, for the question numbers only)", qp, _note(assignment.get("description")))
+        per_page: list[list[dict]] = []
+        read_ok, via1 = 0, ""
+        for i, img in enumerate(work.images):
+            pno = work.page_numbers[i] if i < len(work.page_numbers) else i + 1
+            p1 = (paper + f"\nThe attached image is page {pno} of the student's file"
+                  + (" (the printed paper, with the student's writing on it: the printed questions are NOT the "
+                     "student's work)" if matched else "")
+                  + ". Transcribe the student's answer to every question the student wrote on, on this page. Leave out "
+                    "questions with nothing written by the student. Nothing written by the student on this page: "
+                    '{"questions": []}.\nRespond with JSON of this shape:\n' + TRANSCRIBE_SCHEMA)
+            try:
+                got, via1 = _ask(complete, TRANSCRIBE_SYSTEM, p1, [img] + ([] if matched else qp.images), _parse_page,
+                                 trace, require_vision=True)
+            except ValueError:
+                continue                          # one page the AI could not read must not lose the others
+            read_ok += 1
+            per_page.append(got)
+            if via1 not in via_all:
+                via_all.append(via1)
+        if not read_ok:
+            return Outcome(status="needs_teacher", note="bad_ai_reply: transcription failed on every page. Tried: "
+                           + "; ".join(trace)[:250], flags=["bad_ai_reply"])
+        if read_ok < len(work.images):
+            flags.append("unreadable_part")
+        transcript = merge_transcripts(per_page)
+        if not any(t["transcription"] or t.get("sketch") for t in transcript) and not typed:
+            return Outcome(status="needs_teacher", note="no_answers_found: the AI found no answers written on the "
+                           f"pages it read ({pages_note or f'{len(work.images)} page(s)'}). Not graded.",
+                           flags=["unreadable_work"], via=" + ".join(via_all))
+    if work.images:
+        if transcript and all(not t["legible"] for t in transcript):
             return Outcome(status="needs_teacher", note="unreadable_work: the AI could not read the work. Not graded. "
                            "Tried: " + "; ".join(trace)[:250], flags=["unreadable_work"], via=via1)
         if any(not t["legible"] for t in transcript):
@@ -431,13 +566,35 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     work_text = (typed + "\n" + "\n".join("\n".join(x for x in (t["transcription"], t.get("sketch", "")) if x)
                                           for t in transcript)).strip()
 
+    # A long scanned mark scheme / model answer (a practice book's answers) is copied to text in full, and the marker
+    # gets only the questions the student answered: the free models' prompts stay small, and a practice book the
+    # student did part of is not marked 0 on every question they were not set. A short scan stays as pictures.
+    answered = {_lead(t["ref"]) for t in transcript if t["transcription"] or t.get("sketch")}
+    only_answered = False
+    for key, m in ((assignment.get("markingSchemeUrl") or "", ms), (assignment.get("modelAnswerUrl") or "", ma)):
+        if not m.images or len(m.images) <= C.MAX_PAGES_REFERENCE:
+            continue
+        copied = copy_reference(key, m, complete, trace)
+        if copied is None:
+            m.images = m.images[:C.MAX_PAGES_REFERENCE]       # could not copy it: the first pages, as before
+            continue
+        keep = [q for q in copied if _lead(q["ref"]) in answered] if answered else []
+        only_answered |= bool(keep)
+        m.text = "\n\n".join(f"Question {q['ref']}:\n{q['text']}" for q in (keep or copied))
+        m.images = []
+    if only_answered:
+        pages_note = "; ".join(x for x in (pages_note, "marked the questions answered: "
+                                           + ",".join(sorted(answered, key=lambda r: (len(r), r)))) if x)
+
     # Stage 2: mark from the transcription, with two different models.
     p2 = (f"Assignment: {assignment.get('title', '')}\n\n"
           + (f"=== QUESTIONS ===\n{questions}\n" if questions else "") + block("MARK SCHEME", ms, ms_notes)
           + block("MODEL ANSWER", ma, ma_notes) + guidance_block(guidance)
           + "\n=== STUDENT WORK (transcribed) ===\n" + student
-          + "\nMark every question in the mark scheme (0 for anything not written). Use the mark scheme's own marks "
-            "per question. Respond with JSON of this shape:\n" + MARK_SCHEMA)
+          + ("\nMark each question given in the mark scheme / model answer above (the student answered these questions "
+             "of a longer paper)." if only_answered else
+             "\nMark every question in the mark scheme (0 for anything not written).")
+          + " Use the mark scheme's own marks per question. Respond with JSON of this shape:\n" + MARK_SCHEMA)
     mark_images = ms.images + ma.images          # only non-empty if the scheme itself is a scan
     try:
         res, via2 = _ask(complete, MARK_SYSTEM, p2, mark_images, parse_reply, trace, require_vision=bool(mark_images))
@@ -497,7 +654,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     if res.overall_confidence < LOW_CONFIDENCE or any(q.confidence < LOW_CONFIDENCE for q in res.questions):
         flags.append("low_confidence")
     total_max = sum(q.max_marks for q in res.questions)
-    note = "; ".join(trace)[:400]              # which models were tried and which failed (no student content)
+    # Which pages were read, then which models were tried and which failed (no student content).
+    note = "; ".join(x for x in (pages_note[:250], "; ".join(trace)) if x)[:500]
     conf = min([res.overall_confidence] + [q.confidence for q in res.questions])
     return Outcome(status="graded", total_awarded=sum(q.awarded_marks for q in res.questions), total_max=total_max,
                    confidence=max(0.0, min(1.0, conf)), questions=[q.model_dump() for q in res.questions], note=note,

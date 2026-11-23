@@ -572,3 +572,135 @@ def test_openrouter_tie_break_models_are_current_and_end_with_the_free_router(mo
         monkeypatch.delenv(k, raising=False)
     names = [r.model for r in build_routes(need_vision=False)]
     assert "inclusionai/ling-3.0-flash:free" not in names and names[-1] == "openrouter/free" and len(names) >= 3
+
+
+# ── Long files: a practice book the student wrote on, a long scanned model answer (2026-11-23) ──
+# Seen live: a 50-page practice book with answers on 18 pages got no draft, because only page 1 reached the
+# transcriber (Groq's vision route takes one image) and the model answer's 20 scanned pages were cut to 3.
+from service.materials import written_pages, read_document
+
+
+def book(n: int, ink: tuple = (), scan: bool = False) -> bytes:
+    """n A4 pages; `ink` pages (1-based) carry a large mark, as a student's writing would. scan: no text layer."""
+    d = pymupdf.open()
+    for i in range(1, n + 1):
+        p = d.new_page()
+        if scan:
+            p.draw_rect(pymupdf.Rect(60, 60 + i * 5, 300, 120 + i * 5), color=(0, 0, 0), width=2)
+        else:
+            p.insert_text((72, 72), f"Question {i}. Printed question text for page {i}. " * 2)
+        if i in ink:
+            p.draw_rect(pymupdf.Rect(80, 300, 420, 460), color=(0.8, 0, 0), fill=(0.8, 0, 0))
+    return d.tobytes()
+
+
+def test_written_pages_are_the_ones_that_differ_from_the_blank_paper():
+    blank = book(8)
+    assert written_pages(book(8, ink=(3, 7)), blank) == [2, 6]
+    assert written_pages(blank, blank) == []                       # handed in the blank book
+    assert written_pages(book(7, ink=(3,)), blank) is None          # a different file: read in order instead
+    assert written_pages(pdf("x"), pdf("x")) is None                 # one page: nothing to choose
+
+
+def test_read_document_reads_the_chosen_pages():
+    m = read_document(book(8, ink=(3, 7)), "w.pdf", max_images=24, always_images=True, pages=[2, 6])
+    assert len(m.images) == 2 and m.page_numbers == [3, 7] and m.pages == 8
+
+
+class BookFake:
+    """Transcriber: answers per page ('page N'); copier: one model-answer question per page; marker: marks Q3 and Q7."""
+    def __init__(self, answers=None):
+        self.answers = answers if answers is not None else {3: "3", 7: "7"}
+        self.calls = []
+
+    def __call__(self, system, text, images, want_out=3000, require_vision=False, trace=None, skip=None, **kw):
+        self.calls.append({"system": system[:8], "images": len(images or []), "rv": require_vision, "text": text})
+        hit = re.search(r"[Pp]age (\d+) of the", text)      # not "[page 1]" from the printed paper's text layer
+        page = int(hit.group(1)) if hit else 0
+        if system.startswith("You transcribe"):
+            ref = self.answers.get(page)
+            return json.dumps({"questions": [{"ref": ref, "transcription": f"working for q{ref} x=2", "legible": True}]
+                               if ref else []}), "vision"
+        if system.startswith("You copy"):
+            return json.dumps({"questions": [{"ref": str(page), "text": f"Q{page} M1 method A1 x=2"}]}), "vision"
+        qs = [{"ref": r, "max_marks": 2, "awarded_marks": 2, "feedback": "ok", "confidence": 0.9, "reason": "r",
+               "marks": [{"type": "M1", "awarded": True, "criterion": "m", "evidence": f"working for q{r}"},
+                         {"type": "A1", "awarded": True, "criterion": "a", "evidence": "x=2"}]} for r in ("3", "7")]
+        return json.dumps({"questions": qs, "overall_confidence": 0.9}), ("m2" if skip else "m1")
+
+
+import re
+BOOK = {"https://f/book.pdf": book(8), "https://f/omar.pdf": book(8, ink=(3, 7)), "https://f/ma.pdf": book(8, scan=True)}
+BOOK_A = {"title": "Practice book", "fileUrl": "https://f/book.pdf", "modelAnswerUrl": "https://f/ma.pdf"}
+
+
+def test_a_practice_book_is_read_on_its_written_pages_and_marked_on_the_questions_answered():
+    grader_core._COPIES.clear()
+    f = BookFake()
+    out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/omar.pdf"}, BOOK.__getitem__, f)
+    assert out.status == "graded" and out.total_awarded == 4 and out.total_max == 4
+    reads = [c for c in f.calls if c["system"].startswith("You tran")]
+    assert [re.search(r"page (\d+) of the", c["text"]).group(1) for c in reads] == ["3", "7"]   # only the written pages
+    assert all(c["images"] == 1 and c["rv"] for c in reads)                          # one page per call
+    copies = [c for c in f.calls if c["system"].startswith("You copy")]
+    assert len(copies) == 8 and all(c["images"] == 1 for c in copies)                 # the whole model answer
+    marker = next(c for c in f.calls if c["system"].startswith("You are"))
+    assert marker["images"] == 0 and "Question 3:" in marker["text"] and "Question 7:" in marker["text"]
+    assert "Question 5:" not in marker["text"]                    # not answered: not sent, not marked 0
+    assert "read pages 3,7" in out.note and "marked the questions answered: 3,7" in out.note
+
+
+def test_the_long_model_answer_is_copied_once_per_run():
+    grader_core._COPIES.clear()
+    f1, f2 = BookFake(), BookFake()
+    grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/omar.pdf"}, BOOK.__getitem__, f1)
+    grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/omar.pdf"}, BOOK.__getitem__, f2)
+    assert not [c for c in f2.calls if c["system"].startswith("You copy")]
+
+
+def test_a_blank_book_is_not_sent_to_the_ai():
+    def boom(*a, **k): raise AssertionError("AI must not be called")
+    out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/book.pdf"}, BOOK.__getitem__, boom)
+    assert out.status == "needs_teacher" and out.note.startswith("no_writing")
+
+
+def test_written_pages_with_no_answers_found_go_to_the_teacher():
+    grader_core._COPIES.clear()
+    out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/omar.pdf"}, BOOK.__getitem__, BookFake(answers={}))
+    assert out.status == "needs_teacher" and out.note.startswith("no_answers_found")
+
+
+def test_a_long_photo_file_without_the_blank_paper_is_read_page_by_page_in_order():
+    grader_core._COPIES.clear()
+    files = {"https://f/w.pdf": book(9, scan=True), "https://f/ms.pdf": FILES["https://f/ms.pdf"]}
+    f = BookFake(answers={3: "3", 7: "7"})
+    out = grader_core.grade_submission({"title": "T", "markingSchemeUrl": "https://f/ms.pdf"},
+                                       {"fileUrl": "https://f/w.pdf"}, files.__getitem__, f)
+    reads = [c for c in f.calls if c["system"].startswith("You tran")]
+    assert len(reads) == 9 and out.status == "graded"            # every page, not just the first
+
+
+def test_merge_joins_a_question_that_runs_over_two_pages():
+    m = grader_core.merge_transcripts([[{"ref": "4", "transcription": "a", "sketch": "", "legible": True}],
+                                       [{"ref": "4 ", "transcription": "b", "sketch": "", "legible": False},
+                                        {"ref": "5", "transcription": "c", "sketch": "", "legible": True}]])
+    assert [(t["ref"], t["transcription"], t["legible"]) for t in m] == [("4", "a\nb", False), ("5", "c", True)]
+
+
+def test_drain_takes_no_new_job_after_the_time_budget():
+    class S:
+        def __init__(self): self.n = 0
+        def requeue_stale(self): pass
+    ticks = iter([0, 100, 300, 500, 900])
+    st = S()
+
+    def one(store, **kw):
+        store.n += 1
+        return True
+    import service.worker as w
+    orig = w.process_one
+    w.process_one = one
+    try:
+        assert w.drain(st, limit=25, budget=480, clock=lambda: next(ticks)) == 2
+    finally:
+        w.process_one = orig

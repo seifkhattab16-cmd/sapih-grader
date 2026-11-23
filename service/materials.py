@@ -16,6 +16,7 @@ class Material:
     text: str = ""
     images: list[str] = field(default_factory=list)   # base64 JPEG
     pages: int = 0
+    page_numbers: list[int] = field(default_factory=list)   # 1-based page of each image
 
     @property
     def readable(self) -> bool:
@@ -68,10 +69,48 @@ def _jpeg(page, max_side: int = 1400) -> str:
     return base64.b64encode(pix.tobytes("jpeg", jpg_quality=80)).decode()
 
 
+def _grey(page, width: int = 160) -> tuple[int, int, bytes]:
+    z = width / max(1.0, page.rect.width)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), colorspace=pymupdf.csGRAY, alpha=False)
+    return pix.width, pix.height, pix.samples
+
+
+def written_pages(work: bytes, blank: bytes, margin: float = C.WRITTEN_PAGE_MARGIN) -> list[int] | None:
+    """0-based pages where the student wrote, found by comparing each page of the work with the same page of the
+    blank paper (the assignment's own file, e.g. a practice book the student wrote on). A page counts as written when
+    it differs from the blank one clearly more than a typical page does (the median page: untouched pages still differ
+    a little after the student's app re-saves the file). None when the two files do not line up (not both PDFs, a
+    different page count or page size, under two pages): then the caller reads the pages in order."""
+    if work[:4] != b"%PDF" or blank[:4] != b"%PDF":
+        return None
+    try:
+        a, b = pymupdf.open(stream=work, filetype="pdf"), pymupdf.open(stream=blank, filetype="pdf")
+    except Exception:
+        return None
+    try:
+        if len(a) < 2 or len(a) != len(b):
+            return None
+        scores = []
+        for pa, pb in zip(a, b):
+            wa, ha, x = _grey(pa)
+            wb, hb, y = _grey(pb)
+            if (wa, ha) != (wb, hb):
+                return None
+            scores.append(sum(abs(p - q) for p, q in zip(x, y)) / max(1, len(x)))
+        typical = sorted(scores)[len(scores) // 2]
+        return [i for i, s in enumerate(scores) if s - typical > margin]
+    except Exception:
+        return None
+    finally:
+        a.close()
+        b.close()
+
+
 def read_document(data: bytes, name: str = "", max_images: int = C.MAX_PAGES_REFERENCE,
-                  always_images: bool = False) -> Material:
+                  always_images: bool = False, pages: list[int] | None = None) -> Material:
     """Text from the PDF's text layer, plus page images when it is a scan (or always_images, for
-    the student's handwriting). Unsupported or corrupt files give an empty, unreadable Material."""
+    the student's handwriting): the first max_images pages, or the given 0-based `pages` (still at most max_images).
+    Unsupported or corrupt files give an empty, unreadable Material."""
     try:
         kind = "pdf" if data[:4] == b"%PDF" else (name.rsplit(".", 1)[-1].lower() if "." in name else "png")
         doc = pymupdf.open(stream=data, filetype=kind)
@@ -82,7 +121,9 @@ def read_document(data: bytes, name: str = "", max_images: int = C.MAX_PAGES_REF
         scan = sum(len(t) for t in texts) < C.MIN_TEXT_PER_PAGE * max(1, len(doc))
         m = Material(text="\n\n".join(f"[page {i + 1}]\n{t}" for i, t in enumerate(texts) if t), pages=len(doc))
         if scan or always_images:
-            m.images = [_jpeg(doc[i]) for i in range(min(len(doc), max_images))]
+            chosen = [i for i in (pages if pages is not None else range(len(doc))) if 0 <= i < len(doc)][:max_images]
+            m.images = [_jpeg(doc[i]) for i in chosen]
+            m.page_numbers = [i + 1 for i in chosen]
         return m
     except Exception:
         return Material()

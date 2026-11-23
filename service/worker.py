@@ -2,7 +2,9 @@
 from __future__ import annotations
 import json
 import logging
+import time
 from typing import Callable
+from . import config as C
 from . import grader_core
 from .materials import fetch_bytes
 from .providers import ProviderError, complete as default_complete
@@ -126,9 +128,12 @@ def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Ca
     return True
 
 
-def drain(store, limit: int = 5, **kw) -> int:
+def drain(store, limit: int = 5, budget: float = C.RUN_BUDGET_SECONDS, clock: Callable[[], float] = time.monotonic,
+          **kw) -> int:
+    """Grades up to `limit` jobs, taking no new job once `budget` seconds have passed (a long practice book takes
+    minutes; the Action is stopped at 12 and a job cut off mid-way would sit 'running' until it is requeued)."""
     store.requeue_stale()
-    n = 0
-    while n < limit and process_one(store, **kw):
+    start, n = clock(), 0
+    while n < limit and clock() - start < budget and process_one(store, **kw):
         n += 1
     return n
