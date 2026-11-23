@@ -219,18 +219,30 @@ PROOF_RE = re.compile(r"\b(prove[sd]?|proof|show that|shows that|hence show|dedu
                       re.I)
 
 
-def guess_work_type(q: "QuestionGrade") -> str:
-    """Same rule as the portal's guess (src/utils/markingTypes.js): from the mark-scheme lines."""
-    text = " \n ".join(m.criterion for m in q.marks if m.criterion)
+def guess_work_type(q: "QuestionGrade", question: str = "") -> str:
+    """Same rule as the portal's guess (src/utils/markingTypes.js): from the question's own wording, when it is
+    known, and the mark-scheme lines ("Show that ..." is a proof even when no scheme line says so)."""
+    text = " \n ".join([question] + [m.criterion for m in q.marks if m.criterion])
     return "sketch" if SKETCH_RE.search(text) else "proof" if PROOF_RE.search(text) else "working"
 
 
-def check_work_type(q: "QuestionGrade", work: str, sketch: str) -> list[str]:
+def question_texts(assignment: dict) -> dict[str, str]:
+    """Each question's wording by its number, from the assignment's description when it is written one question per
+    line ("Question 3 [3 marks]: Show that ...", as quizzes are; "3) ..." or "Q3: ..." also work)."""
+    out: dict[str, str] = {}
+    for line in str(assignment.get("description") or "").splitlines():
+        m = re.match(r"\s*(?:question\s*|q\s*)?(\d+)\s*[).:\[]", line, re.I)
+        if m:
+            out.setdefault(m.group(1), line.strip())
+    return out
+
+
+def check_work_type(q: "QuestionGrade", work: str, sketch: str, question: str = "") -> list[str]:
     """3.5 step C: settles the question's work type and checks its proof steps / sketch features against what the
     student actually wrote or drew. Never raises a mark. Returns flags."""
-    guess = guess_work_type(q)
+    guess = guess_work_type(q, question)
     t = _pick(q.work_type, WORK_TYPES, "")
-    # The marker sometimes calls everything "working"; an explicit sketch / prove line in the scheme wins over that.
+    # The marker sometimes calls everything "working"; an explicit sketch / prove wording wins over that.
     q.work_type = guess if (not t or (t == "working" and guess != "working")) else t
     if q.work_type != "proof":
         q.steps = []
@@ -374,6 +386,11 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         return Outcome(status="needs_teacher", note="no_scheme: this assignment has no readable marking scheme or "
                        "model answer. Not graded.", flags=["no_scheme"])
     qp = _read_url(assignment.get("fileUrl") or "", fetch)
+    # The questions themselves: a quiz lists each student's own questions in `description`; homework may describe
+    # them there too, and a printed question paper adds its text layer. (E test, 2026-11-23: without them a "show
+    # that" question was marked as plain working.)
+    questions = "\n".join(x for x in (_note(assignment.get("description")), qp.text[:4000]) if x)
+    qtexts = question_texts(assignment)
 
     def block(title: str, m: Material, notes: str) -> str:
         body = "\n".join(x for x in (notes, m.text) if x) or ("(see attached page images)" if m.images else "")
@@ -390,7 +407,7 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
 
     # Stage 1: transcribe the uploaded file (vision only). Typed answers need no transcription.
     if work.images:
-        p1 = (block("QUESTION PAPER (printed, for the question numbers only)", qp, "")
+        p1 = (block("QUESTION PAPER (printed, for the question numbers only)", qp, _note(assignment.get("description")))
               + "\nThe attached images are the student's pages. Transcribe the student's answer to every question "
                 "in the paper."
               + (f"\nText layer of the file (may only be the printed paper): {work.text[:1500]}" if work.text else "")
@@ -415,7 +432,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                                           for t in transcript)).strip()
 
     # Stage 2: mark from the transcription, with two different models.
-    p2 = (f"Assignment: {assignment.get('title', '')}\n\n" + block("MARK SCHEME", ms, ms_notes)
+    p2 = (f"Assignment: {assignment.get('title', '')}\n\n"
+          + (f"=== QUESTIONS ===\n{questions}\n" if questions else "") + block("MARK SCHEME", ms, ms_notes)
           + block("MODEL ANSWER", ma, ma_notes) + guidance_block(guidance)
           + "\n=== STUDENT WORK (transcribed) ===\n" + student
           + "\nMark every question in the mark scheme (0 for anything not written). Use the mark scheme's own marks "
@@ -475,7 +493,7 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         q.transcription = (t["transcription"] if t else typed)[:1500]
         q.legible = t["legible"] if t else True
         q.sketch = (t.get("sketch", "") if t else "")[:800]
-        flags.extend(check_work_type(q, work_text, q.sketch))
+        flags.extend(check_work_type(q, work_text, q.sketch, qtexts.get(_lead(q.ref), "")))
     if res.overall_confidence < LOW_CONFIDENCE or any(q.confidence < LOW_CONFIDENCE for q in res.questions):
         flags.append("low_confidence")
     total_max = sum(q.max_marks for q in res.questions)

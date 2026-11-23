@@ -47,11 +47,17 @@ def build_routes(need_vision: bool, want_out: int = 3000) -> list[Route]:
         # Only models that accept images are used for image requests (the old defaults were text-only
         # and answered "illegible" without seeing the page). Free models come and go: see
         # https://openrouter.ai/models?input_modalities=image&max_price=0
+        # Checked 2026-11-23 against https://openrouter.ai/api/v1/models (ling-3.0-flash was gone: 404; gemma-4 is
+        # often busy: 429). "openrouter/free" is OpenRouter's own router to any free model: the last resort, so a
+        # tie between the first two markers is still broken by a third model instead of falling to the lower mark.
         if need_vision:
             models, imgs = C.lst(C.env("OPENROUTER_VISION_MODELS",
-                "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")), 4
+                "google/gemma-4-31b-it:free,nvidia/nemotron-3.5-super-vl:free,google/gemma-4-26b-a4b-it:free,"
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")), 4
         else:
-            models, imgs = C.lst(C.env("OPENROUTER_MODELS", "google/gemma-4-31b-it:free,inclusionai/ling-3.0-flash:free")), 0
+            models, imgs = C.lst(C.env("OPENROUTER_MODELS",
+                "nvidia/nemotron-3-ultra-550b-a55b:free,inclusionai/ling-3.2-flash:free,google/gemma-4-31b-it:free,"
+                "openrouter/free")), 0
         for m in models:
             by["openrouter"].append(Route(f"openrouter:{m}", "openai", "https://openrouter.ai/api/v1/chat/completions",
                                           ok, m, imgs, min(want_out, 3000), headers={"X-Title": "Saiph grader"}))

@@ -36,7 +36,7 @@ class Fake:
         self.calls = []
 
     def __call__(self, system, text, images, want_out=3000, require_vision=False, trace=None, skip=None, **kw):
-        self.calls.append({"system": system[:20], "images": len(images or []), "rv": require_vision, "skip": skip})
+        self.calls.append({"system": system[:20], "images": len(images or []), "rv": require_vision, "skip": skip, "text": text})
         if system.startswith("You transcribe"):
             return json.dumps(self.transcript), "vision"
         if skip and "m2" in skip:
@@ -540,3 +540,35 @@ def test_verdict_eval_compares_the_new_grade_with_the_teachers_marks():
     assert rows[0]["rows"][0]["teacher"] == 1 and rows[0]["rows"][0]["before"] == 2
     s = verdict_eval.summarise(rows)["working"]
     assert s["questions"] == 1
+
+
+# ── 3.5 E fixes (test quiz, 2026-11-23) ──
+
+def test_the_marker_and_transcriber_see_the_question_text():
+    a = dict(ASSIGN, description="Question 1 [2 marks]: Solve x^2 - 4 = 0")
+    f = Fake()
+    grader_core.grade_submission(a, SUB, fetch, f)
+    assert "Solve x^2 - 4 = 0" in f.calls[0]["text"]                       # transcriber: for the numbering
+    assert "=== QUESTIONS ===" in f.calls[1]["text"] and "Solve x^2 - 4 = 0" in f.calls[1]["text"]
+
+
+def test_a_show_that_question_is_a_proof_even_when_the_marker_says_working():
+    a = dict(ASSIGN, description="Question 1 [2 marks]: Given n is an integer, show that n^2+n is even")
+    m = proof_marking([], work_type="working")             # no scheme line says "show that"
+    out = grader_core.grade_submission(a, SUB, fetch, Fake(transcript=PROOF_T, first=m))
+    assert out.questions[0]["work_type"] == "proof" and "proof_check" in out.flags
+
+
+def test_question_texts_by_number():
+    t = grader_core.question_texts({"description": "Question 1 [2 marks]: A\nQuestion 2: B\n3) C\nQ4: D\nnot a question"})
+    assert sorted(t) == ["1", "2", "3", "4"] and t["2"] == "Question 2: B"
+    assert grader_core.question_texts({}) == {}
+
+
+def test_openrouter_tie_break_models_are_current_and_end_with_the_free_router(monkeypatch):
+    from service.providers import build_routes
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    for k in ("GROQ_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_MODELS"):
+        monkeypatch.delenv(k, raising=False)
+    names = [r.model for r in build_routes(need_vision=False)]
+    assert "inclusionai/ling-3.0-flash:free" not in names and names[-1] == "openrouter/free" and len(names) >= 3
