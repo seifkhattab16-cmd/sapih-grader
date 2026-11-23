@@ -66,6 +66,37 @@ def quiz_assignment(paper: dict) -> dict | None:
             "markingSchemeNotes": sep.join(ms), "modelAnswerNotes": sep.join(ma)}
 
 
+def assignment_for(store, kind: str, sub: dict) -> tuple[dict | None, str]:
+    """What the grader marks against: (assignment-shaped dict, "") or (None, why it cannot be graded)."""
+    if kind == "class_question":
+        return class_question_assignment(sub["_cq"]), ""
+    if kind == "submission":
+        return (store.get_assignment(sub.get("assignment_id")) or {}).get("data", {}), ""
+    paper = sub.get("_quiz") or {}
+    if paper.get("versioned") and not paper.get("has_version"):
+        return None, "no_paper: versioned quiz but this student has no version row"
+    a = quiz_assignment(paper) if paper.get("type") == "bank" else None
+    return (a, "") if a else (None, "no_scheme: not a bank quiz, or no question has a typed mark scheme")
+
+
+def guidance_for(store, job: dict, sub: dict) -> dict | None:
+    """3.6: the teacher's marking notes and corrections for this work. Never stops a grade: on any error, none."""
+    get = getattr(store, "guidance", None)
+    if not get:
+        return None
+    if job["kind"] == "submission":
+        work_id = sub.get("assignment_id")
+    elif job["kind"] == "quiz" and not (sub.get("_quiz") or {}).get("versioned"):
+        work_id = sub.get("quiz_id")
+    else:
+        return None                     # class questions have no notes; a versioned quiz's numbers differ per student
+    try:
+        return get(job["kind"], work_id, exclude_submission=job["submission_id"])
+    except Exception as e:
+        log.warning("guidance not read: %s", type(e).__name__)
+        return None
+
+
 def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Callable = default_complete) -> bool:
     """Returns True if a job was handled (so the caller should try for another)."""
     job = store.claim_next()
@@ -76,20 +107,12 @@ def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Ca
         if not sub:
             store.finish(job["id"], "failed", "submission no longer exists")
             return True
-        if job["kind"] == "class_question":
-            assignment = class_question_assignment(sub["_cq"])
-        elif job["kind"] == "submission":
-            assignment = (store.get_assignment(sub.get("assignment_id")) or {}).get("data", {})
-        else:
-            paper = sub.get("_quiz") or {}
-            if paper.get("versioned") and not paper.get("has_version"):
-                store.finish(job["id"], "needs_teacher", "no_paper: versioned quiz but this student has no version row")
-                return True
-            assignment = quiz_assignment(paper) if paper.get("type") == "bank" else None
-            if not assignment:
-                store.finish(job["id"], "needs_teacher", "no_scheme: not a bank quiz, or no question has a typed mark scheme")
-                return True
-        out = grader_core.grade_submission(assignment, sub.get("data") or {}, fetch, complete)
+        assignment, why = assignment_for(store, job["kind"], sub)
+        if not assignment:
+            store.finish(job["id"], "needs_teacher", why)
+            return True
+        out = grader_core.grade_submission(assignment, sub.get("data") or {}, fetch, complete,
+                                           guidance=guidance_for(store, job, sub))
         if out.status == "graded":
             store.save_grade(job, sub, out)
             store.finish(job["id"], "done", (",".join(out.flags) + " | " + out.note)[:500])

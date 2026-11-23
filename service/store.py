@@ -108,6 +108,38 @@ class Store:
         r.raise_for_status()
         return (r.json() or [None])[0]
 
+    def guidance(self, kind: str, work_id: str | None, exclude_submission: str | None = None,
+                 max_examples: int = C.MAX_TEACHER_EXAMPLES) -> dict:
+        """Roadmap 3.6: what the teacher has already told the AI about this piece of work.
+        - notes: her marking notes per question (marking_notes), e.g. "accept answers in terms of pi";
+        - examples: questions on other students' papers of the SAME work where she changed the AI's mark or wrote
+          why, newest first (approved drafts only; never "Approve all" and never a question she left unmarked).
+        Only for work whose question numbers mean the same thing on every paper (an assignment, or a quiz that is
+        not versioned); a versioned quiz numbers each student's own questions, so its notes cannot be matched."""
+        out = {"notes": [], "examples": []}
+        if not work_id or kind not in ("submission", "quiz"):
+            return out
+        r = self.c.get(self._u("marking_notes"), headers=self._h(),
+                       params={"work_id": f"eq.{work_id}", "select": "question_ref,note", "order": "question_ref.asc"})
+        r.raise_for_status()
+        out["notes"] = [{"ref": n["question_ref"], "note": n["note"]} for n in r.json() or []]
+        params = {"kind": f"eq.{kind}", "status": "eq.approved", "select": "submission_id,questions,approved_at",
+                  "order": "approved_at.desc", "limit": "40"}
+        if kind == "submission":
+            params["assignment_id"] = f"eq.{work_id}"
+        else:
+            s = self.c.get(self._u("quiz_submissions"), headers=self._h(),
+                           params={"quiz_id": f"eq.{work_id}", "select": "id", "limit": "500"})
+            s.raise_for_status()
+            ids = [x["id"] for x in s.json() or []]
+            if not ids:
+                return out
+            params["submission_id"] = f"in.({','.join(ids)})"
+        r = self.c.get(self._u("ai_grades"), headers=self._h(), params=params)
+        r.raise_for_status()
+        out["examples"] = teacher_examples(r.json() or [], exclude_submission, max_examples)
+        return out
+
     def save_grade(self, job: dict, sub: dict, out) -> None:
         row = {"kind": job["kind"], "submission_id": job["submission_id"], "course_id": sub.get("course_id"),
                "assignment_id": sub.get("assignment_id"), "student_uid": sub.get("student_uid"),
@@ -121,6 +153,35 @@ class Store:
             return
         self.c.post(self._u("ai_grades"), params={"on_conflict": "kind,submission_id"},
                     headers=self._h({"Prefer": "resolution=merge-duplicates"}), json=row).raise_for_status()
+
+
+def teacher_examples(drafts: list[dict], exclude_submission: str | None = None, limit: int = 6) -> list[dict]:
+    """Questions where the teacher's own mark differs from the AI's, or where she wrote why: the cases the AI should
+    learn from. Newest first, at most `limit`, never two from the same question number."""
+    out, seen = [], set()
+    for d in drafts:
+        if exclude_submission and d.get("submission_id") == exclude_submission:
+            continue
+        for q in d.get("questions") or []:
+            t = (q or {}).get("teacher") or {}
+            if not t or t.get("bulk") or t.get("unmarked"):
+                continue
+            try:
+                teacher, ai = float(t.get("awarded")), float(q.get("awarded_marks") or 0)
+            except (TypeError, ValueError):
+                continue
+            why = str(t.get("why") or "").strip()
+            if teacher == ai and not why:
+                continue
+            ref = str(q.get("ref") or "")
+            if ref in seen:
+                continue
+            seen.add(ref)
+            out.append({"ref": ref, "max": q.get("max_marks"), "ai": ai, "teacher": teacher, "why": why[:200],
+                        "work": str(t.get("transcription") or q.get("transcription") or "")[:300]})
+            if len(out) >= limit:
+                return out
+    return out
 
 
 def _now() -> str:

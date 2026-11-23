@@ -197,6 +197,10 @@ MARK_SYSTEM = (
     "asymptotes, turning points, labels...): `state` is \"seen\" only if the sketch description shows it, with "
     "`evidence` copied from that description; \"missing\" only if the description clearly lacks it; otherwise "
     "\"unsure\". Leave `steps` and `features` empty for other work types. "
+    "(10) If TEACHER'S MARKING NOTES are given, they are the teacher's own rulings on this paper: apply them exactly, "
+    "and where a note and the mark scheme disagree, the note wins. TEACHER'S CORRECTIONS are questions on other "
+    "students' papers where the teacher changed the AI's mark: follow the same judgement on similar work, but mark "
+    "this student only from this student's own lines (rule 1 still holds). "
     "Reply with ONLY one JSON object, no prose."
 )
 MARK_SCHEMA = (
@@ -324,8 +328,32 @@ def _lead(ref: str) -> str:
     return m.group(1) if m else str(ref)
 
 
+def guidance_block(guidance: dict | None) -> str:
+    """Roadmap 3.6: the teacher's marking notes and her corrections on other papers of the same work, as prompt text.
+    Empty when there are none. Never names a student."""
+    g = guidance or {}
+    out = ""
+    notes = [n for n in g.get("notes") or [] if str(n.get("note") or "").strip()]
+    if notes:
+        out += "=== TEACHER'S MARKING NOTES (her rulings for this paper) ===\n" + "\n".join(
+            f"Q{n['ref']}: {str(n['note']).strip()[:500]}" for n in notes) + "\n"
+    ex = g.get("examples") or []
+    if ex:
+        def m(v):
+            return int(v) if float(v).is_integer() else v
+        lines = []
+        for e in ex:
+            work = " ".join(str(e.get("work") or "").split())
+            lines.append(f"Q{e['ref']}: the AI gave {m(e['ai'])}" + (f"/{e['max']}" if e.get("max") else "")
+                         + f", the teacher gave {m(e['teacher'])}." + (f" Why: {e['why']}" if e.get("why") else "")
+                         + (f" (That student wrote: {work})" if work else ""))
+        out += ("=== TEACHER'S CORRECTIONS (other students, same paper; learn her judgement, do not copy marks) ===\n"
+                + "\n".join(lines) + "\n")
+    return out
+
+
 def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], bytes],
-                     complete: Callable = default_complete) -> Outcome:
+                     complete: Callable = default_complete, guidance: dict | None = None) -> Outcome:
     """assignment / submission are the `data` JSON of their rows.
 
     Two stages, so that seeing and judging are separate (a single call kept 'explaining away' wrong working to
@@ -353,6 +381,10 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
 
     trace: list[str] = []
     flags: list[str] = []
+    # Noted in the job's trace, not in `flags`: the portal treats any flag as "look closely at this draft".
+    g = guidance or {}
+    if g.get("notes") or g.get("examples"):
+        trace.append(f"teacher guidance: {len(g.get('notes') or [])} note(s), {len(g.get('examples') or [])} correction(s)")
     via_all: list[str] = []
     transcript: list[dict] = []
 
@@ -384,7 +416,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
 
     # Stage 2: mark from the transcription, with two different models.
     p2 = (f"Assignment: {assignment.get('title', '')}\n\n" + block("MARK SCHEME", ms, ms_notes)
-          + block("MODEL ANSWER", ma, ma_notes) + "\n=== STUDENT WORK (transcribed) ===\n" + student
+          + block("MODEL ANSWER", ma, ma_notes) + guidance_block(guidance)
+          + "\n=== STUDENT WORK (transcribed) ===\n" + student
           + "\nMark every question in the mark scheme (0 for anything not written). Use the mark scheme's own marks "
             "per question. Respond with JSON of this shape:\n" + MARK_SCHEMA)
     mark_images = ms.images + ma.images          # only non-empty if the scheme itself is a scan

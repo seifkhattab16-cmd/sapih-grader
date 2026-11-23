@@ -431,3 +431,112 @@ def test_fetch_bytes_refuses_bad_references(monkeypatch, bad):
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "sekret")
     with pytest.raises(ValueError):
         materials.fetch_bytes(bad)
+
+
+# ---- 3.6: the teacher's marking notes and corrections reach the marking prompt ----
+from service.store import teacher_examples
+
+GUIDE = {"notes": [{"ref": "1", "note": "Accept answers in terms of pi"}],
+         "examples": [{"ref": "1", "max": 2, "ai": 2.0, "teacher": 1.0, "why": "no check of x=-2", "work": "x = 2"}]}
+
+
+def _capturing():
+    seen = []
+    base = Fake()
+    def c(system, text, images, **kw):
+        seen.append((system, text))
+        return base(system, text, images, **kw)
+    return c, seen
+
+
+def test_marking_prompt_carries_the_teachers_notes_and_corrections():
+    c, seen = _capturing()
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, c, guidance=GUIDE)
+    marks = [t for s, t in seen if s.startswith("You are a strict")]
+    assert marks and all("Q1: Accept answers in terms of pi" in t for t in marks)
+    assert all("the AI gave 2/2, the teacher gave 1. Why: no check of x=-2 (That student wrote: x = 2)" in t for t in marks)
+    assert not any("TEACHER'S" in t for s, t in seen if s.startswith("You transcribe"))   # the reader never sees them
+    assert out.flags == [] and "teacher guidance: 1 note(s), 1 correction(s)" in out.note  # info, not a warning flag
+
+
+def test_no_guidance_leaves_the_prompt_unchanged():
+    c, seen = _capturing()
+    grader_core.grade_submission(ASSIGN, SUB, fetch, c, guidance={"notes": [], "examples": []})
+    assert not any("TEACHER'S" in t for s, t in seen)
+
+
+def test_teacher_examples_keep_only_her_own_changes_and_reasons():
+    q = lambda ref, ai, t: {"ref": ref, "max_marks": 3, "awarded_marks": ai, "transcription": "w", "teacher": t}
+    drafts = [
+        {"submission_id": "me", "questions": [q("1", 3, {"awarded": 0})]},                       # this paper: skipped
+        {"submission_id": "a", "questions": [q("1", 3, {"awarded": 3}),                          # agreed, no why
+                                             q("2", 3, {"awarded": 1, "why": "sign error"}),
+                                             q("3", 2, {"awarded": 0, "bulk": True}),            # Approve all
+                                             q("4", 2, {"awarded": 0, "unmarked": True})]},      # not a verdict
+        {"submission_id": "b", "questions": [q("2", 0, {"awarded": 2}),                          # same Q again: skipped
+                                             q("5", 1, {"awarded": 1, "why": "ok to leave as 3/4"})]},
+    ]
+    ex = teacher_examples(drafts, exclude_submission="me")
+    assert [(e["ref"], e["ai"], e["teacher"]) for e in ex] == [("2", 3, 1), ("5", 1, 1)]
+    assert teacher_examples(drafts, "me", limit=1)[0]["why"] == "sign error"
+
+
+def test_worker_reads_guidance_for_assignments_but_not_versioned_quizzes():
+    calls = []
+    st = FakeStore()
+    st.guidance = lambda kind, wid, exclude_submission=None: calls.append((kind, wid, exclude_submission)) or GUIDE
+    assert worker.drain(st, fetch=fetch, complete=Fake()) == 1
+    assert calls == [("submission", "a", "s1")] and st.status[0] == "done"
+    st = FakeStore(kind="quiz"); calls.clear()
+    st.guidance = lambda *a, **k: calls.append(a) or GUIDE
+    st.get_submission = lambda k, i: {"course_id": "c", "quiz_id": "q", "student_uid": "u", "data": SUB,
+                                      "_quiz": {**_paper(), "versioned": True, "has_version": True}}
+    worker.drain(st, fetch=fetch, complete=Fake())
+    assert calls == [] and st.status[0] == "done"
+
+
+def test_worker_still_grades_when_guidance_cannot_be_read():
+    st = FakeStore()
+    def boom(*a, **k): raise RuntimeError("db down")
+    st.guidance = boom
+    worker.drain(st, fetch=fetch, complete=Fake())
+    assert st.status[0] == "done"
+
+
+def test_store_guidance_queries_notes_and_approved_drafts_of_the_same_work(monkeypatch):
+    import httpx
+    from service.store import Store
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    seen = []
+    def handle(req):
+        seen.append((req.url.path, dict(req.url.params)))
+        if req.url.path.endswith("/marking_notes"):
+            return httpx.Response(200, json=[{"question_ref": "1", "note": "pi ok"}])
+        if req.url.path.endswith("/quiz_submissions"):
+            return httpx.Response(200, json=[{"id": "s1"}, {"id": "s2"}])
+        return httpx.Response(200, json=[{"submission_id": "s2", "questions": [
+            {"ref": "1", "max_marks": 2, "awarded_marks": 2, "teacher": {"awarded": 0, "why": "wrong root"}}]}])
+    st = Store(httpx.Client(transport=httpx.MockTransport(handle)))
+    g = st.guidance("submission", "A1", exclude_submission="s1")
+    assert g["notes"] == [{"ref": "1", "note": "pi ok"}] and g["examples"][0]["why"] == "wrong root"
+    assert seen[0][1]["work_id"] == "eq.A1"
+    assert seen[1][1]["assignment_id"] == "eq.A1" and seen[1][1]["status"] == "eq.approved"
+    seen.clear()
+    st.guidance("quiz", "Q1", exclude_submission="s1")
+    assert seen[1][1]["quiz_id"] == "eq.Q1" and seen[2][1]["submission_id"] == "in.(s1,s2)"
+    assert st.guidance("class_question", "x") == {"notes": [], "examples": []}
+
+
+def test_verdict_eval_compares_the_new_grade_with_the_teachers_marks():
+    from service import verdict_eval
+    draft = {"id": "d1", "questions": [
+        {"ref": "1", "awarded_marks": 2, "teacher": {"awarded": 1, "type": "working"}},
+        {"ref": "2", "awarded_marks": 0, "teacher": {"awarded": 0, "bulk": True}},
+        {"ref": "3", "awarded_marks": 1, "teacher": {"awarded": 0, "unmarked": True}}]}
+    assert verdict_eval.checked_questions(draft) == {"1": (1.0, "working")}
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, Fake(first=marking(total=1)))
+    rows = verdict_eval.compare(draft, out)
+    assert rows[0]["rows"][0]["teacher"] == 1 and rows[0]["rows"][0]["before"] == 2
+    s = verdict_eval.summarise(rows)["working"]
+    assert s["questions"] == 1

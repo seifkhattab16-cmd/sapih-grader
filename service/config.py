@@ -34,3 +34,4 @@ MAX_ATTEMPTS = 3
 MAX_PAGES_STUDENT = 6        # page images sent for the student's work
 MAX_PAGES_REFERENCE = 3      # page images sent per reference document (QP / MS / MA) when it is a scan
 MIN_TEXT_PER_PAGE = 40       # fewer characters than this per page = a scan, send images instead
+MAX_TEACHER_EXAMPLES = 6     # 3.6: the teacher's corrected questions on the same work, shown to the marker as examples

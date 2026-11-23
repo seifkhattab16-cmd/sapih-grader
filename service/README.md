@@ -21,3 +21,13 @@ uvicorn service.app:app --port 8080
 docker build -f service/Dockerfile -t grader .
 ```
 `POST /tick` (with the secret) drains the queue; `GET /health` is open. A GitHub Action should call `/tick` every ~5 minutes to keep a free host awake.
+
+## Teacher guidance (roadmap 3.6)
+Before marking, the worker reads what the teacher already said about the same work (`Store.guidance`):
+her marking notes per question (`marking_notes`) and up to 6 questions on other students' papers where she changed
+the AI's mark or wrote why (approved drafts only; never "Approve all"). Both go into the marking prompt only (the
+transcriber never sees them); the job note records how many were used. Not for class questions or versioned quizzes
+(their question numbers differ per student).
+
+Re-test a prompt change against her saved verdicts (nothing is written):
+`python -m service.verdict_eval --limit 30` (add `--no-guidance` to compare without her notes and corrections).
