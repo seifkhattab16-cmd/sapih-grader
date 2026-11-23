@@ -131,6 +131,100 @@ def test_low_confidence_flagged():
     assert "low_confidence" in out.flags
 
 
+# ── 3.5 step C: work type, proof steps, sketch features ──
+
+def test_plain_working_is_typed_working_with_no_steps_or_features():
+    m = marking()
+    m["questions"][0]["steps"] = [{"text": "x=2", "state": "valid"}]          # stray steps on working are dropped
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, Fake(first=m))
+    q = out.questions[0]
+    assert q["work_type"] == "working" and q["steps"] == [] and q["features"] == []
+    assert "proof_check" not in out.flags and "sketch_check" not in out.flags and q["confidence"] == 0.9
+
+
+PROOF_T = {"questions": [{"ref": "1", "transcription": "n^2+n = n(n+1) one of n, n+1 is even so n(n+1) is even",
+                          "legible": True}]}
+
+
+def proof_marking(steps, work_type="proof"):
+    return {"questions": [{"ref": "1", "max_marks": 2, "awarded_marks": 2, "work_type": work_type, "feedback": "ok",
+                           "confidence": 0.95, "reason": "r", "steps": steps, "marks": [
+                               {"type": "M1", "awarded": True, "criterion": "factorises", "evidence": "n(n+1)"},
+                               {"type": "A1", "awarded": True, "criterion": "complete argument", "evidence": "is even"}]}],
+            "overall_confidence": 0.95}
+
+
+def test_proof_steps_are_checked_against_the_writing_and_always_flagged():
+    steps = [{"text": "n^2+n = n(n+1)", "state": "valid", "reason": "factorised"},
+             {"text": "n(n+1) is a product of consecutive integers", "state": "valid", "reason": "invented"},
+             {"text": "so n(n+1) is even", "state": "maybe", "reason": ""}]
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, Fake(transcript=PROOF_T, first=proof_marking(steps)))
+    q = out.questions[0]
+    assert q["work_type"] == "proof" and "proof_check" in out.flags
+    assert [s["state"] for s in q["steps"]] == ["valid", "unclear", "unclear"]   # invented line, unknown state
+    assert "not found in the student's writing" in q["steps"][1]["reason"]
+    assert q["confidence"] <= 0.5 and out.confidence <= 0.5 and out.total_awarded == 2   # never raises or drops marks
+
+
+def test_scheme_that_says_show_that_overrides_a_working_label():
+    m = proof_marking([], work_type="working")
+    m["questions"][0]["marks"][1]["criterion"] = "Shows that n^2+n is even"
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, Fake(transcript=PROOF_T, first=m))
+    assert out.questions[0]["work_type"] == "proof" and out.questions[0]["steps"] == []
+    assert "proof_check" in out.flags
+
+
+SKETCH_T = {"questions": [{"ref": "1", "transcription": "y = 1/(x-2)",
+                           "sketch": "two curves either side of a dashed vertical line labelled x=2; crosses y axis at -1/2",
+                           "legible": True}]}
+
+
+def sketch_marking(features):
+    return {"questions": [{"ref": "1", "max_marks": 3, "awarded_marks": 2, "work_type": "sketch", "feedback": "ok",
+                           "confidence": 0.9, "reason": "r", "features": features, "marks": [
+                               {"type": "B1", "awarded": True, "criterion": "correct shape of the graph",
+                                "evidence": "two curves either side"},
+                               {"type": "B1", "awarded": True, "criterion": "asymptote x=2", "evidence": "dashed vertical line labelled x=2"},
+                               {"type": "B1", "awarded": False, "criterion": "horizontal asymptote y=0", "evidence": ""}]}],
+            "overall_confidence": 0.9}
+
+
+def test_sketch_features_need_the_drawing_to_show_them():
+    feats = [{"name": "Asymptotes", "state": "seen", "evidence": "dashed vertical line labelled x=2"},
+             {"name": "Intercepts with the axes", "state": "seen", "evidence": "crosses x axis at 3"},   # not drawn
+             {"name": "Labels", "state": "missing"},
+             {"name": "", "state": "seen"}]
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, Fake(transcript=SKETCH_T, first=sketch_marking(feats)))
+    q = out.questions[0]
+    assert q["work_type"] == "sketch" and "sketch_check" in out.flags and q["sketch"].startswith("two curves")
+    assert [(f["name"], f["state"]) for f in q["features"]] == [
+        ("Asymptotes", "seen"), ("Intercepts with the axes", "unsure"), ("Labels", "missing")]
+    assert out.total_awarded == 2 and "evidence_not_found" not in out.flags   # marks may quote the sketch description
+    assert q["confidence"] <= 0.5
+
+
+def test_sketch_with_nothing_described_or_illegible_is_all_unsure():
+    no_drawing = {"questions": [{"ref": "1", "transcription": "y = 1/(x-2)", "sketch": "", "legible": True}]}
+    feats = [{"name": "Asymptotes", "state": "missing"}, {"name": "Shape", "state": "seen", "evidence": "y = 1/(x-2)"}]
+    m = sketch_marking(feats)
+    for mk in m["questions"][0]["marks"]:
+        mk["awarded"], mk["evidence"] = False, ""
+    m["questions"][0]["awarded_marks"] = 0
+    out = grader_core.grade_submission(ASSIGN, SUB, fetch, Fake(transcript=no_drawing, first=m))
+    assert [f["state"] for f in out.questions[0]["features"]] == ["unsure", "seen"]   # "missing" needs a description
+
+    q = QuestionGrade(max_marks=1, work_type="sketch", legible=False,
+                      features=[{"name": "Asymptotes", "state": "seen", "evidence": "x=2"}])
+    assert grader_core.check_work_type(q, "x=2", "x=2") == ["sketch_check"] and q.features[0].state == "unsure"
+
+
+def test_transcriber_is_asked_to_describe_sketches_without_the_scheme():
+    f = Fake(transcript=SKETCH_T, first=sketch_marking([]))
+    grader_core.grade_submission(ASSIGN, SUB, fetch, f)
+    assert "sketch" in grader_core.TRANSCRIBE_SCHEMA and "describe only what is drawn" in grader_core.TRANSCRIBE_SYSTEM
+    assert "work_type" in grader_core.MARK_SCHEMA and '"steps"' in grader_core.MARK_SCHEMA
+
+
 def test_evidence_matching_is_forgiving_about_spacing_and_minus_signs():
     assert evidence_ok("x = −2", "x=-2 x=-3")
     assert evidence_ok("(x - 2)(x - 3)", "(x-2)(x-3)=0")

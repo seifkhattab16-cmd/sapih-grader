@@ -40,6 +40,40 @@ class MarkLine(BaseModel):
     evidence: str = ""
 
 
+WORK_TYPES = ("working", "proof", "sketch")
+STEP_STATES = ("valid", "unclear", "wrong")
+FEATURE_STATES = ("seen", "missing", "unsure")
+# Proofs and sketches are never more than "Medium" until 3.5 measures them: the teacher always makes the call.
+CHECK_CONFIDENCE = 0.5
+
+
+def _pick(v, allowed: tuple, default: str) -> str:
+    v = str(v or "").strip().lower()
+    return v if v in allowed else default
+
+
+class ProofStep(BaseModel):
+    text: str = ""
+    state: str = "unclear"
+    reason: str = ""
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _state(cls, v) -> str:
+        return _pick(v, STEP_STATES, "unclear")
+
+
+class SketchFeature(BaseModel):
+    name: str = ""
+    state: str = "unsure"
+    evidence: str = ""
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _state(cls, v) -> str:
+        return _pick(v, FEATURE_STATES, "unsure")
+
+
 class QuestionGrade(BaseModel):
     ref: str = "?"
     max_marks: int = Field(ge=0, le=100)
@@ -50,11 +84,20 @@ class QuestionGrade(BaseModel):
     confidence: float = 0.5
     reason: str = ""
     legible: bool = True
+    work_type: str = ""                  # working | proof | sketch (3.5 step C); "" until classified
+    steps: list[ProofStep] = []          # proofs only
+    features: list[SketchFeature] = []   # sketches only
+    sketch: str = ""                     # the transcriber's neutral description of a drawn graph, if any
 
     @field_validator("confidence")
     @classmethod
     def _clamp(cls, v: float) -> float:
         return max(0.0, min(1.0, float(v)))
+
+    @field_validator("steps", "features", mode="before")
+    @classmethod
+    def _list(cls, v):
+        return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
 
 
 class GradeResult(BaseModel):
@@ -127,9 +170,14 @@ TRANSCRIBE_SYSTEM = (
     "You transcribe handwriting. You do NOT mark and you do NOT solve. Copy exactly what the student wrote for each "
     "question, line by line, including mistakes, crossings-out and unfinished lines. Never correct, complete, tidy or "
     "guess. A question number (often circled, e.g. a bare '1') is a label, not an answer. If nothing is written for a "
-    "question, its transcription must be an empty string. Reply with ONLY one JSON object, no prose."
+    "question, its transcription must be an empty string. If the student DREW a graph or sketch, describe only what is "
+    "drawn in `sketch`: the shape, where it meets the axes and the values written there, any asymptotes drawn (dashed "
+    "lines and their labels), marked turning points, and every label exactly as written. Do not judge whether it is "
+    "right, and never add a feature that is not drawn. No drawing: `sketch` is an empty string. "
+    "Reply with ONLY one JSON object, no prose."
 )
-TRANSCRIBE_SCHEMA = '{"questions":[{"ref":"1","transcription":"<exactly what the student wrote>","legible":true|false}]}'
+TRANSCRIBE_SCHEMA = ('{"questions":[{"ref":"1","transcription":"<exactly what the student wrote>",'
+                     '"sketch":"<what is drawn, or empty>","legible":true|false}]}')
 
 MARK_SYSTEM = (
     "You are a strict maths examiner (Edexcel style: M = method, A = accuracy, B = independent mark). You mark ONLY "
@@ -141,15 +189,69 @@ MARK_SYSTEM = (
     "(5) Never invent working the student did not write. (6) A method mark (M) is earned when the correct result of "
     "that method is present in the student's lines (e.g. 12x^2 appearing earns 'reduces a power by one'); do not ask "
     "for an extra visible step unless the scheme line says 'show'. Wrong or missing results still earn nothing. "
+    "(7) Set `work_type` per question: \"sketch\" when the question asks for a sketch or graph, \"proof\" when it asks "
+    "to prove / show that / deduce, otherwise \"working\". (8) For a proof, list the student's argument in `steps`, in "
+    "order: each `text` is an EXACT copy of one line the student wrote; `state` is \"valid\" (follows correctly from "
+    "what came before), \"wrong\" (a false or unjustified step) or \"unclear\" (cannot tell); give a short `reason`. "
+    "(9) For a sketch, list in `features` each feature the mark scheme or model answer requires (shape, intercepts, "
+    "asymptotes, turning points, labels...): `state` is \"seen\" only if the sketch description shows it, with "
+    "`evidence` copied from that description; \"missing\" only if the description clearly lacks it; otherwise "
+    "\"unsure\". Leave `steps` and `features` empty for other work types. "
     "Reply with ONLY one JSON object, no prose."
 )
 MARK_SCHEMA = (
     '{"questions":[{"ref":"1a","max_marks":<int>,"awarded_marks":<int 0..max_marks>,'
+    '"work_type":"working"|"proof"|"sketch",'
     '"marks":[{"type":"M1"|"A1"|"B1"|...,"awarded":true|false,"criterion":"<mark scheme line>",'
     '"evidence":"<EXACT copy from the transcription, or empty if not awarded>"}],'
+    '"steps":[{"text":"<EXACT copy of one line of the proof>","state":"valid"|"unclear"|"wrong","reason":"<why>"}],'
+    '"features":[{"name":"<required feature>","state":"seen"|"missing"|"unsure","evidence":"<copied, or empty>"}],'
     '"feedback":"<one or two sentences for the student>","confidence":<0..1>,"reason":"<why these marks>"}],'
     '"overall_confidence":<0..1>}'
 )
+
+SKETCH_RE = re.compile(r"\b(sketch\w*|graph|asymptotes?|correct shape|shape of (the )?(curve|graph))\b", re.I)
+PROOF_RE = re.compile(r"\b(prove[sd]?|proof|show that|shows that|hence show|deduce that|by induction|by contradiction)\b",
+                      re.I)
+
+
+def guess_work_type(q: "QuestionGrade") -> str:
+    """Same rule as the portal's guess (src/utils/markingTypes.js): from the mark-scheme lines."""
+    text = " \n ".join(m.criterion for m in q.marks if m.criterion)
+    return "sketch" if SKETCH_RE.search(text) else "proof" if PROOF_RE.search(text) else "working"
+
+
+def check_work_type(q: "QuestionGrade", work: str, sketch: str) -> list[str]:
+    """3.5 step C: settles the question's work type and checks its proof steps / sketch features against what the
+    student actually wrote or drew. Never raises a mark. Returns flags."""
+    guess = guess_work_type(q)
+    t = _pick(q.work_type, WORK_TYPES, "")
+    # The marker sometimes calls everything "working"; an explicit sketch / prove line in the scheme wins over that.
+    q.work_type = guess if (not t or (t == "working" and guess != "working")) else t
+    if q.work_type != "proof":
+        q.steps = []
+    if q.work_type != "sketch":
+        q.features = []
+    flags: list[str] = []
+    if q.work_type == "proof":
+        for s in q.steps:
+            if not evidence_ok(s.text, work):
+                s.state, s.reason = "unclear", "This line was not found in the student's writing. " + s.reason
+        q.steps = [s for s in q.steps if s.text.strip()]
+        flags.append("proof_check")
+    elif q.work_type == "sketch":
+        for f in q.features:
+            if not q.legible:
+                f.state = "unsure"
+            elif f.state == "seen" and not evidence_ok(f.evidence, sketch + "\n" + work):
+                f.state = "unsure"            # "seen" needs the drawing's description to show it
+            elif f.state == "missing" and not sketch.strip():
+                f.state = "unsure"            # nothing was described, so nothing can be called missing
+        q.features = [f for f in q.features if f.name.strip()]
+        flags.append("sketch_check")
+    if q.work_type in ("proof", "sketch"):
+        q.confidence = min(q.confidence, CHECK_CONFIDENCE)
+    return flags
 
 
 def _norm(s: str) -> str:
@@ -213,6 +315,7 @@ def _parse_transcription(text: str) -> list[dict]:
     if not isinstance(qs, list) or not qs:
         raise ValueError("no questions in transcription")
     return [{"ref": str(q.get("ref", "?")), "transcription": str(q.get("transcription") or "").strip(),
+             "sketch": str(q.get("sketch") or "").strip(),
              "legible": bool(q.get("legible", True))} for q in qs if isinstance(q, dict)]
 
 
@@ -272,9 +375,12 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                            "Tried: " + "; ".join(trace)[:250], flags=["unreadable_work"], via=via1)
         if any(not t["legible"] for t in transcript):
             flags.append("unreadable_part")
-    work_lines = "\n".join(f"Q{t['ref']}: {t['transcription'] or '(nothing written)'}" for t in transcript)
+    work_lines = "\n".join(f"Q{t['ref']}: {t['transcription'] or '(nothing written)'}"
+                           + (f"\n  [sketch drawn: {t['sketch']}]" if t.get("sketch") else "") for t in transcript)
     student = (f"Typed answer:\n{typed}\n" if typed else "") + (f"Transcribed handwriting:\n{work_lines}\n" if transcript else "")
-    work_text = (typed + "\n" + "\n".join(t["transcription"] for t in transcript)).strip()
+    # A sketch's description counts as the student's work: marks for a drawn feature quote it as evidence.
+    work_text = (typed + "\n" + "\n".join("\n".join(x for x in (t["transcription"], t.get("sketch", "")) if x)
+                                          for t in transcript)).strip()
 
     # Stage 2: mark from the transcription, with two different models.
     p2 = (f"Assignment: {assignment.get('title', '')}\n\n" + block("MARK SCHEME", ms, ms_notes)
@@ -335,6 +441,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         t = next((x for x in transcript if _lead(x["ref"]) == _lead(q.ref)), None)
         q.transcription = (t["transcription"] if t else typed)[:1500]
         q.legible = t["legible"] if t else True
+        q.sketch = (t.get("sketch", "") if t else "")[:800]
+        flags.extend(check_work_type(q, work_text, q.sketch))
     if res.overall_confidence < LOW_CONFIDENCE or any(q.confidence < LOW_CONFIDENCE for q in res.questions):
         flags.append("low_confidence")
     total_max = sum(q.max_marks for q in res.questions)
