@@ -99,8 +99,13 @@ def guidance_for(store, job: dict, sub: dict) -> dict | None:
         return None
 
 
-def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Callable = default_complete) -> bool:
-    """Returns True if a job was handled (so the caller should try for another)."""
+PAUSED = "paused"
+
+
+def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Callable = default_complete,
+                deadline: float | None = None, clock: Callable[[], float] = time.monotonic):
+    """Returns True if a job was handled (so the caller should try for another), False when the queue is empty, or
+    PAUSED when a job was put back part-way (rate limits / time): the caller should stop for this run."""
     job = store.claim_next()
     if not job:
         return False
@@ -113,15 +118,27 @@ def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Ca
         if not assignment:
             store.finish(job["id"], "needs_teacher", why)
             return True
+        cache = store.cache() if hasattr(store, "cache") else None
         out = grader_core.grade_submission(assignment, sub.get("data") or {}, fetch, complete,
-                                           guidance=guidance_for(store, job, sub))
+                                           guidance=guidance_for(store, job, sub), cache=cache,
+                                           deadline=deadline, clock=clock)
         if out.status == "graded":
             store.save_grade(job, sub, out)
             store.finish(job["id"], "done", (",".join(out.flags) + " | " + out.note)[:500])
         else:
             store.finish(job["id"], "needs_teacher", out.note)
-    except ProviderError as e:      # providers busy or rate-limited: put it back, try later (attempt counted)
-        store.finish(job["id"], "queued" if job["attempts"] < 3 else "failed", f"providers: {e}")
+    except (grader_core.Paused, ProviderError) as e:
+        if isinstance(e, ProviderError) and not getattr(e, "rate_limited", False):
+            # providers down or refusing: put it back, try later (attempt counted)
+            store.finish(job["id"], "queued" if job["attempts"] < 3 else "failed", f"providers: {e}")
+            return True
+        # Rate-limited, or a long paper ran out of this run's time: pages read so far are cached, the attempt is not
+        # counted, and the run stops taking jobs (the providers need a rest; run_once starts the next run).
+        if hasattr(store, "pause"):
+            store.pause(job, f"paused: {str(e)[:120]}; carries on in the next run")
+        else:
+            store.finish(job["id"], "queued", f"paused: {str(e)[:120]}")
+        return PAUSED
     except Exception as e:
         log.error("grading job %s failed: %s", job["id"], type(e).__name__)  # no details: public Action logs
         store.finish(job["id"], "queued" if job["attempts"] < 3 else "failed", f"{type(e).__name__}: {str(e)[:200]}")
@@ -134,6 +151,12 @@ def drain(store, limit: int = 5, budget: float = C.RUN_BUDGET_SECONDS, clock: Ca
     minutes; the Action is stopped at 12 and a job cut off mid-way would sit 'running' until it is requeued)."""
     store.requeue_stale()
     start, n = clock(), 0
-    while n < limit and clock() - start < budget and process_one(store, **kw):
+    while n < limit and clock() - start < budget:
+        r = process_one(store, deadline=start + C.JOB_BUDGET_SECONDS, clock=clock, **kw)
+        if not r:
+            break
         n += 1
+        if r == PAUSED:
+            store.paused = True
+            break
     return n

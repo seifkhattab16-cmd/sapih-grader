@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 from difflib import SequenceMatcher
 import re
+import time
 from typing import Callable, Optional
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from . import config as C
 from .materials import Material, read_document, is_file_ref, written_pages
-from .providers import complete as default_complete
+from .providers import ProviderError, complete as default_complete
 
 LOW_CONFIDENCE = 0.6
 
@@ -384,6 +385,42 @@ def merge_transcripts(pages: list[list[dict]]) -> list[dict]:
     return list(out.values())
 
 
+class Paused(Exception):
+    """A long paper stopped part-way (rate limits, or the run's time is up). The pages read so far are in the cache;
+    the job goes back in the queue without using up an attempt, and the next run carries on from there."""
+
+
+class _Pages:
+    """Per-page AI results (a student's transcribed page, a copied reference page), kept between runs when the worker
+    gives a lasting cache (grader_cache table); a plain dict in tests. Also enforces the job's deadline."""
+    def __init__(self, cache, deadline: float | None, clock):
+        self.cache = cache if cache is not None else {}
+        self.deadline, self.clock = deadline, clock
+
+    def get(self, key: str, make):
+        """The cached value, or make() stored under key. Raises Paused when time is up or every provider is
+        rate-limited; a page the AI could not read (ValueError) is not cached, so a later run tries it again."""
+        try:
+            hit = self.cache.get(key)
+        except Exception:
+            hit = None
+        if hit is not None:
+            return hit
+        if self.deadline is not None and self.clock() > self.deadline:
+            raise Paused("time is up for this run")
+        try:
+            val = make()
+        except ProviderError as e:
+            if getattr(e, "rate_limited", False):
+                raise Paused("rate-limited") from e
+            raise
+        try:
+            self.cache[key] = val
+        except Exception:
+            pass                                      # a lost cache write only costs a repeat call later
+        return val
+
+
 COPY_SYSTEM = (
     "You copy a printed maths document (a worked model answer or a mark scheme) into plain text. For each question on "
     "the page, copy its number, every part's working and final answer, and every mark label (M1, A1, B1, ...) next to "
@@ -402,19 +439,22 @@ def _parse_copy(text: str) -> list[dict]:
             for q in qs if isinstance(q, dict) and str(q.get("text") or "").strip()]
 
 
-def copy_reference(key: str, m: Material, complete, trace: list[str]) -> list[dict] | None:
+def copy_reference(key: str, m: Material, complete, trace: list[str], pages: "_Pages | None" = None) -> list[dict] | None:
     """A long scanned mark scheme or model answer, copied to text one page per call (a vision route may take a single
     image), so the marker can use every page rather than the first few pictures. [{ref, text}] in page order, or None
-    when no page could be copied (the caller then keeps the pictures)."""
+    when no page could be copied (the caller then keeps the pictures). Pages are cached by file and page number (an
+    upload never changes: a new file gets a new reference), so every student of the assignment reuses them."""
     if key in _COPIES:
         return _COPIES[key]
+    pages = pages or _Pages(None, None, None)
     parts: list[dict] = []
     for i, img in enumerate(m.images):
         pno = m.page_numbers[i] if i < len(m.page_numbers) else i + 1
         try:
-            got, _ = _ask(complete, COPY_SYSTEM, f"Page {pno} of the document. Respond with JSON of this shape:\n"
-                          + COPY_SCHEMA, [img], _parse_copy, trace, require_vision=True)
-        except Exception:
+            got = pages.get(f"copy:{key}:{pno}", lambda: _ask(
+                complete, COPY_SYSTEM, f"Page {pno} of the document. Respond with JSON of this shape:\n" + COPY_SCHEMA,
+                [img], _parse_copy, trace, require_vision=True)[0])
+        except (ValueError, ProviderError):
             continue                                  # one unreadable page must not lose the others
         parts += got
     if not parts:
@@ -457,17 +497,22 @@ def guidance_block(guidance: dict | None) -> str:
 
 
 def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], bytes],
-                     complete: Callable = default_complete, guidance: dict | None = None) -> Outcome:
+                     complete: Callable = default_complete, guidance: dict | None = None,
+                     cache=None, deadline: float | None = None, clock: Callable[[], float] = time.monotonic) -> Outcome:
     """assignment / submission are the `data` JSON of their rows.
 
     Two stages, so that seeing and judging are separate (a single call kept 'explaining away' wrong working to
     match the mark scheme): (1) a vision model only TRANSCRIBES the handwriting, without the mark scheme in view;
     (2) text models mark from the transcription, twice with different models; every awarded mark must quote the
-    transcription, or it is denied."""
+    transcription, or it is denied.
+    cache / deadline: per-page results of a multi-page file are kept in `cache` (a dict-like store); past `deadline`
+    (by `clock`), or when every provider is rate-limited, it raises Paused and a later call carries on from the cache."""
     typed = (submission.get("text") or "").strip()
+    pages = _Pages(cache, deadline, clock)
     qp_url = assignment.get("fileUrl") or ""
     qp_bytes = _fetch(qp_url, fetch)
-    work, matched, pages_note = _student_work(submission.get("fileUrl") or "", fetch, qp_bytes)
+    work_url = submission.get("fileUrl") or ""
+    work, matched, pages_note = _student_work(work_url, fetch, qp_bytes)
     if not typed and pages_note.startswith("no_writing"):
         return Outcome(status="needs_teacher", note=pages_note, flags=["unreadable_work"])
     if not typed and not work.readable:
@@ -535,9 +580,10 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                     "questions with nothing written by the student. Nothing written by the student on this page: "
                     '{"questions": []}.\nRespond with JSON of this shape:\n' + TRANSCRIBE_SCHEMA)
             try:
-                got, via1 = _ask(complete, TRANSCRIBE_SYSTEM, p1, [img] + ([] if matched else qp.images), _parse_page,
-                                 trace, require_vision=True)
-            except ValueError:
+                got, via1 = pages.get(f"page:{work_url}:{pno}:{int(matched)}", lambda: list(_ask(
+                    complete, TRANSCRIBE_SYSTEM, p1, [img] + ([] if matched else qp.images), _parse_page, trace,
+                    require_vision=True)))
+            except (ValueError, ProviderError):
                 continue                          # one page the AI could not read must not lose the others
             read_ok += 1
             per_page.append(got)
@@ -574,7 +620,7 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     for key, m in ((assignment.get("markingSchemeUrl") or "", ms), (assignment.get("modelAnswerUrl") or "", ma)):
         if not m.images or len(m.images) <= C.MAX_PAGES_REFERENCE:
             continue
-        copied = copy_reference(key, m, complete, trace)
+        copied = copy_reference(key, m, complete, trace, pages)
         if copied is None:
             m.images = m.images[:C.MAX_PAGES_REFERENCE]       # could not copy it: the first pages, as before
             continue

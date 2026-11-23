@@ -37,6 +37,10 @@ MAX_PAGES_REFERENCE = 3      # page images sent per reference document (QP / MS 
 MAX_PAGES_REFERENCE_COPY = 30  # a longer scanned mark scheme / model answer is copied to text, one page per call
 WRITTEN_PAGE_MARGIN = 0.3    # a page is "written on" when it differs from the blank paper this much more than a
                              # typical untouched page does (mean grey-level difference, 0-255, at 160 px wide)
-RUN_BUDGET_SECONDS = 480     # the Action stops after 12 minutes: take no new job after 8
+RUN_BUDGET_SECONDS = 480     # the Action stops after 12 minutes: take no new job after 8, and pause a long paper
+                             # (pages read so far are kept in grader_cache) once the run is 9 minutes in
+JOB_BUDGET_SECONDS = 540
+RATE_LIMIT_RETRIES = 2       # a call refused with 429 by every route is tried again this many times...
+RATE_LIMIT_WAIT = 30         # ...after waiting the provider's Retry-After, at most this many seconds
 MIN_TEXT_PER_PAGE = 40       # fewer characters than this per page = a scan, send images instead
 MAX_TEACHER_EXAMPLES = 6     # 3.6: the teacher's corrected questions on the same work, shown to the marker as examples

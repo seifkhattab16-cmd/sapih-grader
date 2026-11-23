@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: read
+  actions: write      # a long paper that paused part-way starts the next run itself (run_once.py)
 jobs:
   grade:
     runs-on: ubuntu-latest
@@ -33,4 +34,5 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REQUEUE: ${{ inputs.requeue }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python -m service.run_once

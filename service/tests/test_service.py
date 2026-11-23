@@ -704,3 +704,103 @@ def test_drain_takes_no_new_job_after_the_time_budget():
         assert w.drain(st, limit=25, budget=480, clock=lambda: next(ticks)) == 2
     finally:
         w.process_one = orig
+
+
+# ── Free-tier rate limits on long papers: pause, keep the pages read, carry on next run (2026-11-23) ──
+# Seen live: the first long-book run hit 429 on every provider part-way and the job used up its 3 attempts at once.
+
+class LimitedFake(BookFake):
+    """Like BookFake, but every provider is rate-limited after `budget` calls."""
+    def __init__(self, budget, **kw):
+        super().__init__(**kw)
+        self.budget = budget
+
+    def __call__(self, system, text, images, **kw):
+        if self.budget <= 0:
+            raise ProviderError("all providers failed: 429", rate_limited=True)
+        self.budget -= 1
+        return super().__call__(system, text, images, **kw)
+
+
+def test_a_rate_limited_long_paper_pauses_and_the_next_run_reuses_the_pages_read():
+    grader_core._COPIES.clear()
+    cache = {}
+    with pytest.raises(grader_core.Paused):
+        grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/omar.pdf"}, BOOK.__getitem__, LimitedFake(5),
+                                     cache=cache)
+    assert len(cache) == 5                                          # the 5 pages read are kept
+    grader_core._COPIES.clear()                                     # a new run: only the lasting cache survives
+    f = BookFake()
+    out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/omar.pdf"}, BOOK.__getitem__, f, cache=cache)
+    assert out.status == "graded" and out.total_awarded == 4
+    vision = [c for c in f.calls if c["system"].startswith(("You tran", "You copy"))]
+    assert len(vision) == 2 + 8 - 5                                 # only the pages not read before
+
+
+def test_a_long_paper_pauses_when_the_run_is_out_of_time():
+    grader_core._COPIES.clear()
+    t = iter(range(0, 10_000, 100))
+    with pytest.raises(grader_core.Paused):
+        grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/omar.pdf"}, BOOK.__getitem__, BookFake(),
+                                     cache={}, deadline=250, clock=lambda: next(t))
+
+
+def test_complete_waits_and_retries_when_every_route_is_rate_limited():
+    import httpx
+    calls, slept = [], []
+
+    def post(url, headers=None, json=None):
+        calls.append(url)
+        req = httpx.Request("POST", url)
+        if len(calls) <= 2:
+            return httpx.Response(429, headers={"retry-after": "7"}, request=req)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]}, request=req)
+
+    class C:
+        def post(self, *a, **k): return post(*a, **k)
+    r = Route("a", "openai", "https://x/a", "k", "m", 0, 100)
+    out, via = complete("s", "t", routes=[r, Route("b", "openai", "https://x/b", "k", "m", 0, 100)], client=C(),
+                        sleep=slept.append)
+    assert out == "ok" and slept == [7] and len(calls) == 3
+
+
+def test_complete_marks_a_rate_limit_it_could_not_get_past():
+    import httpx
+
+    class C:
+        def post(self, url, **k): return httpx.Response(429, request=httpx.Request("POST", url))
+    with pytest.raises(ProviderError) as e:
+        complete("s", "t", routes=[Route("a", "openai", "https://x/a", "k", "m", 0, 100)], client=C(), sleep=lambda s: 0)
+    assert e.value.rate_limited
+
+
+def test_worker_pauses_a_rate_limited_job_without_counting_the_attempt_and_stops_the_run():
+    class S:
+        def __init__(self):
+            self.jobs = [{"id": "j1", "kind": "submission", "submission_id": "s1", "attempts": 1},
+                         {"id": "j2", "kind": "submission", "submission_id": "s2", "attempts": 1}]
+            self.paused_jobs, self.finished = [], []
+        def requeue_stale(self): pass
+        def claim_next(self): return self.jobs.pop(0) if self.jobs else None
+        def get_submission(self, kind, sid): return {"assignment_id": "a", "data": {"fileUrl": "https://f/omar.pdf"}}
+        def get_assignment(self, aid): return {"data": BOOK_A}
+        def pause(self, job, note): self.paused_jobs.append((job["id"], note))
+        def finish(self, *a): self.finished.append(a)
+        def cache(self): return {}
+    grader_core._COPIES.clear()
+    st = S()
+    n = worker.drain(st, limit=5, fetch=BOOK.__getitem__, complete=LimitedFake(3))
+    assert n == 1 and st.paused_jobs and st.paused_jobs[0][0] == "j1" and not st.finished
+    assert st.jobs and st.paused is True                            # j2 waits for the next run
+
+
+def test_run_once_continues_only_after_progress():
+    from service.run_once import should_continue
+
+    class S: pass
+    s = S()
+    assert not should_continue(s)
+    s.paused = True
+    assert not should_continue(s)                                   # paused with nothing read: do not loop
+    s.cache_writes = 3
+    assert should_continue(s)

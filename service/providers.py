@@ -3,12 +3,15 @@ Each provider is used only if its key is set. A provider that is rate-limited, d
 request is skipped and the next one is tried."""
 from __future__ import annotations
 from dataclasses import dataclass, field
+import time
 import httpx
 from . import config as C
 
 
 class ProviderError(Exception):
-    pass
+    def __init__(self, msg: str, rate_limited: bool = False):
+        super().__init__(msg)
+        self.rate_limited = rate_limited   # every route said "too many requests": wait, do not count it as a failure
 
 
 @dataclass
@@ -91,12 +94,22 @@ def _call(route: Route, system: str, text: str, images: list[str], client: httpx
     return r.json()["choices"][0]["message"]["content"] or ""
 
 
+def _retry_after(e: Exception) -> float:
+    try:
+        return float(getattr(e, "response").headers.get("retry-after") or 0)
+    except Exception:
+        return 0.0
+
+
 def complete(system: str, text: str, images: list[str] | None = None, want_out: int = 3000,
              routes: list[Route] | None = None, client: httpx.Client | None = None,
-             require_vision: bool = False, trace: list | None = None, skip: list | None = None) -> tuple[str, str]:
+             require_vision: bool = False, trace: list | None = None, skip: list | None = None,
+             sleep=time.sleep) -> tuple[str, str]:
     """Returns (reply text, provider name). Raises ProviderError when every route failed.
     require_vision: the images ARE the work (handwriting), so a text-only model must never answer:
-    it would not see the work and would grade it as blank."""
+    it would not see the work and would grade it as blank.
+    When routes failed with 429 (free tiers limit tokens per minute, and a page image costs many), it waits
+    (Retry-After, at most C.RATE_LIMIT_WAIT seconds) and tries them all again, C.RATE_LIMIT_RETRIES times."""
     images = images or []
     routes = routes if routes is not None else build_routes(bool(images), want_out)
     if require_vision and images:
@@ -109,20 +122,28 @@ def complete(system: str, text: str, images: list[str] | None = None, want_out: 
     client = client or httpx.Client(timeout=120)
     errors = []
     try:
-        for r in routes:
-            try:
-                out = _call(r, system, text, images, client)
-                if out.strip():
-                    if trace is not None:
-                        trace.append(f"{r.name}: replied")
-                    return out, r.name
-                errors.append(f"{r.name}: empty reply")
-            except Exception as e:  # rate limit, outage, bad model name: try the next route
-                code = getattr(getattr(e, "response", None), "status_code", "")
-                errors.append(f"{r.name}: {type(e).__name__} {code} {str(e)[:120]}")
-            if trace is not None:
-                trace.append(errors[-1][:90])      # model + error only, never any student content
-        raise ProviderError("all providers failed: " + "; ".join(errors))
+        for round_ in range(C.RATE_LIMIT_RETRIES + 1):
+            limited, wait = False, 0.0
+            for r in routes:
+                try:
+                    out = _call(r, system, text, images, client)
+                    if out.strip():
+                        if trace is not None:
+                            trace.append(f"{r.name}: replied")
+                        return out, r.name
+                    errors.append(f"{r.name}: empty reply")
+                except Exception as e:  # rate limit, outage, bad model name: try the next route
+                    code = getattr(getattr(e, "response", None), "status_code", "")
+                    if code == 429:
+                        limited, wait = True, max(wait, _retry_after(e))
+                    errors.append(f"{r.name}: {type(e).__name__} {code} {str(e)[:120]}")
+                if trace is not None:
+                    trace.append(errors[-1][:90])      # model + error only, never any student content
+            if not limited:
+                break
+            if round_ < C.RATE_LIMIT_RETRIES:
+                sleep(min(C.RATE_LIMIT_WAIT, wait or C.RATE_LIMIT_WAIT))
+        raise ProviderError("all providers failed: " + "; ".join(errors[-6:]), rate_limited=limited)
     finally:
         if own:
             client.close()

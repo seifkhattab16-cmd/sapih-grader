@@ -49,6 +49,16 @@ class Store:
         self.c.patch(self._u("grading_jobs"), headers=self._h(), params={"id": f"eq.{job_id}"},
                      json={"status": status, "note": note[:500], "updated_at": _now()}).raise_for_status()
 
+    def pause(self, job: dict, note: str = "") -> None:
+        """A long paper stopped part-way (rate limits or the run's time): back in the queue, and this claim does not
+        count as one of its attempts (the pages read so far are in grader_cache)."""
+        self.c.patch(self._u("grading_jobs"), headers=self._h(), params={"id": f"eq.{job['id']}"},
+                     json={"status": "queued", "attempts": max(0, job["attempts"] - 1), "note": note[:500],
+                           "updated_at": _now()}).raise_for_status()
+
+    def cache(self) -> "LastingCache":
+        return LastingCache(self)
+
     def get_submission(self, kind: str, sid: str) -> dict | None:
         if kind == "class_question":
             return self._class_question_answer(sid)
@@ -186,3 +196,22 @@ def teacher_examples(drafts: list[dict], exclude_submission: str | None = None, 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class LastingCache:
+    """Per-page AI results kept between runs (table grader_cache, service key only): a long practice book is read
+    over several runs without reading a page twice. Keys name an uploaded file and a page; uploads never change."""
+    def __init__(self, store: Store):
+        self.s, self.writes = store, 0
+
+    def get(self, key: str):
+        r = self.s.c.get(self.s._u("grader_cache"), headers=self.s._h(), params={"key": f"eq.{key}", "select": "value"})
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0]["value"] if rows else None
+
+    def __setitem__(self, key: str, value) -> None:
+        self.s.c.post(self.s._u("grader_cache"), headers=self.s._h({"Prefer": "resolution=merge-duplicates"}),
+                      json={"key": key, "value": value, "updated_at": _now()}).raise_for_status()
+        self.writes += 1
+        self.s.cache_writes = getattr(self.s, "cache_writes", 0) + 1   # run_once: did this run make progress?
