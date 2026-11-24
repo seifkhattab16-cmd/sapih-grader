@@ -1009,3 +1009,14 @@ def test_a_booklet_without_bank_access_falls_back_to_the_assignment_files():
     out = grader_core.grade_submission({"title": "Booklet", "fileUrl": "https://f/bk.pdf"},
                                        {"fileUrl": "https://f/bk-omar.pdf"}, BK.__getitem__, BookletFake(), bank=None)
     assert out.status == "needs_teacher" and out.note.startswith("no_scheme")
+
+
+def test_a_question_left_out_of_the_booklet_list_is_not_marked_and_not_flagged():
+    grader_core._COPIES.clear()
+    m = {**MANI, "q": [MANI["q"][0]]}                       # question 2 taken out of the list (not in the syllabus)
+    files = {"https://f/bk.pdf": _booklet(4, m), "https://f/bk-omar.pdf": _booklet(4, m, ink=(2, 4))}
+    out = grader_core.grade_submission({"title": "Booklet", "fileUrl": "https://f/bk.pdf"},
+                                       {"fileUrl": "https://f/bk-omar.pdf"}, files.__getitem__, BookletFake(),
+                                       bank=lambda ids: ROWS)
+    assert out.status == "graded" and "no_answer_for_some" not in out.flags
+    assert "not marked (not in the booklet's question list): 7" in out.note   # page 4 is no longer a listed page

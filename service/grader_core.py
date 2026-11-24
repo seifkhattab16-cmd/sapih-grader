@@ -765,6 +765,12 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         covered = {_lead(q["ref"]) for name in kept for q in kept[name]}
         leads = sorted(answered & covered, key=_ref_order)
         missing = sorted(answered - covered, key=_ref_order)
+        # A booklet: a question not in its list (left out by the teacher, e.g. not in the syllabus) is not marked and
+        # not flagged; a listed one with nothing stored is flagged for the teacher.
+        unlisted = [m for m in missing if refs and m not in refs]
+        missing = [m for m in missing if m not in unlisted]
+        if unlisted:
+            pages_note += f"; not marked (not in the booklet's question list): {','.join(unlisted)}"
         if missing:
             flags.append("no_answer_for_some")
             pages_note += (f"; not marked (no stored mark scheme in the bank): {','.join(missing)}" if refs
