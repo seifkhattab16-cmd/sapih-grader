@@ -1020,3 +1020,22 @@ def test_a_question_left_out_of_the_booklet_list_is_not_marked_and_not_flagged()
                                        bank=lambda ids: ROWS)
     assert out.status == "graded" and "no_answer_for_some" not in out.flags
     assert "not marked (not in the booklet's question list): 7" in out.note   # page 4 is no longer a listed page
+
+
+def test_questions_the_teacher_left_out_are_not_marked_or_counted():
+    grader_core._COPIES.clear()
+    f = BookFake()                                            # the student answered 3 and 7; the marker marks both
+    out = grader_core.grade_submission({**BOOK_A, "leaveOutQuestions": ["7"]}, {"fileUrl": "https://f/omar.pdf"},
+                                       BOOK.__getitem__, f)
+    assert out.status == "graded" and out.total_awarded == 2 and out.total_max == 2
+    assert {q["ref"] for q in out.questions} == {"3"}
+    assert "left out by the teacher: 7" in out.note
+    markers = [c for c in f.calls if c["system"].startswith("You are")]
+    assert all("Qa7" not in c["text"] and "Q7:" not in c["text"] for c in markers)   # its work is not sent either
+
+
+def test_a_paper_whose_every_answer_was_left_out_goes_to_the_teacher():
+    grader_core._COPIES.clear()
+    out = grader_core.grade_submission({**BOOK_A, "leaveOutQuestions": ["3", "7"]}, {"fileUrl": "https://f/omar.pdf"},
+                                       BOOK.__getitem__, BookFake())
+    assert out.status == "needs_teacher"

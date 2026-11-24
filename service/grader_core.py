@@ -654,6 +654,13 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                            "Tried: " + "; ".join(trace)[:250], flags=["unreadable_work"], via=via1)
         if any(not t["legible"] for t in transcript):
             flags.append("unreadable_part")
+    # R1.5: questions the teacher left out of marking (not in the syllabus, misprinted) are neither marked nor counted.
+    leave = {str(x).strip() for x in (assignment.get("leaveOutQuestions") or []) if str(x).strip()}
+    if leave:
+        dropped = sorted({_lead(t["ref"]) for t in transcript} & leave, key=_ref_order)
+        transcript = [t for t in transcript if _lead(t["ref"]) not in leave]
+        if dropped:
+            pages_note = "; ".join(x for x in (pages_note, f"left out by the teacher: {','.join(dropped)}") if x)
     work_lines = "\n".join(f"Q{t['ref']}: {t['transcription'] or '(nothing written)'}"
                            + (f"\n  [sketch drawn: {t['sketch']}]" if t.get("sketch") else "") for t in transcript)
     student = (f"Typed answer:\n{typed}\n" if typed else "") + (f"Transcribed handwriting:\n{work_lines}\n" if transcript else "")
@@ -814,6 +821,11 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     except ValueError as e:
         return Outcome(status="needs_teacher", note=f"bad_ai_reply: {e}. Tried: " + "; ".join(trace)[:250],
                        flags=["bad_ai_reply"])
+    if leave:                                     # a marker that marked the whole scheme anyway: drop them here too
+        all_q = [q for q in all_q if _lead(q.ref) not in leave]
+        if not all_q:
+            return Outcome(status="needs_teacher", note="nothing left to mark: every answered question was left out by "
+                           "the teacher. Not graded.", flags=["no_scheme"], via=" + ".join(via_all))
     res = GradeResult(questions=all_q, overall_confidence=min(overall))
     for q in res.questions:
         # The part's own transcription when the student's parts were read separately, else the whole question's.
