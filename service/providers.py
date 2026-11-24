@@ -104,12 +104,13 @@ def _retry_after(e: Exception) -> float:
 def complete(system: str, text: str, images: list[str] | None = None, want_out: int = 3000,
              routes: list[Route] | None = None, client: httpx.Client | None = None,
              require_vision: bool = False, trace: list | None = None, skip: list | None = None,
-             sleep=time.sleep) -> tuple[str, str]:
+             sleep=time.sleep, clock=time.monotonic) -> tuple[str, str]:
     """Returns (reply text, provider name). Raises ProviderError when every route failed.
     require_vision: the images ARE the work (handwriting), so a text-only model must never answer:
     it would not see the work and would grade it as blank.
     When routes failed with 429 (free tiers limit tokens per minute, and a page image costs many), it waits
-    (Retry-After, at most C.RATE_LIMIT_WAIT seconds) and tries them all again, C.RATE_LIMIT_RETRIES times."""
+    (Retry-After, at most C.RATE_LIMIT_WAIT seconds) and tries them all again, C.RATE_LIMIT_RETRIES times, as long as
+    the whole call stays within C.CALL_BUDGET_SECONDS."""
     images = images or []
     routes = routes if routes is not None else build_routes(bool(images), want_out)
     if require_vision and images:
@@ -119,12 +120,17 @@ def complete(system: str, text: str, images: list[str] | None = None, want_out: 
     if not routes:
         raise ProviderError("no AI provider key is set")
     own = client is None
-    client = client or httpx.Client(timeout=120)
+    client = client or httpx.Client(timeout=C.REQUEST_TIMEOUT)
     errors = []
+    started = clock()
+    out_of_time = False
     try:
         for round_ in range(C.RATE_LIMIT_RETRIES + 1):
             limited, wait = False, 0.0
             for r in routes:
+                if clock() - started > C.CALL_BUDGET_SECONDS:
+                    out_of_time = True             # slow or busy providers: stop here, the caller pauses the job
+                    break
                 try:
                     out = _call(r, system, text, images, client)
                     if out.strip():
@@ -139,11 +145,14 @@ def complete(system: str, text: str, images: list[str] | None = None, want_out: 
                     errors.append(f"{r.name}: {type(e).__name__} {code} {str(e)[:120]}")
                 if trace is not None:
                     trace.append(errors[-1][:90])      # model + error only, never any student content
-            if not limited:
+            if not limited or out_of_time:
                 break
-            if round_ < C.RATE_LIMIT_RETRIES:
-                sleep(min(C.RATE_LIMIT_WAIT, wait or C.RATE_LIMIT_WAIT))
-        raise ProviderError("all providers failed: " + "; ".join(errors[-6:]), rate_limited=limited)
+            pause = min(C.RATE_LIMIT_WAIT, wait or C.RATE_LIMIT_WAIT)
+            if round_ >= C.RATE_LIMIT_RETRIES or clock() - started + pause > C.CALL_BUDGET_SECONDS:
+                break                              # out of retries or of this call's time: the caller pauses the job
+            sleep(pause)
+        raise ProviderError("all providers failed: " + "; ".join(errors[-6:]) + (" (call took too long)" if out_of_time
+                            else ""), rate_limited=limited or out_of_time)
     finally:
         if own:
             client.close()

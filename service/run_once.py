@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.WARNING)
 
 
 def start_next_run(repo: str, token: str) -> bool:
-    """A long paper paused part-way (rate limits or the 12-minute limit): start another run now instead of waiting
+    """A long paper paused part-way (rate limits or the run's time limit): start another run now instead of waiting
     hours for GitHub's schedule. The Action's own GITHUB_TOKEN may start a workflow_dispatch run."""
     if not repo or not token:
         return False

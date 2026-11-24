@@ -841,3 +841,15 @@ def test_a_long_paper_is_marked_in_batches_and_the_batches_are_cached(monkeypatc
     f2 = BatchFake(answers=answers)                                 # a resumed run: nothing is marked twice
     grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/many.pdf"}, files.__getitem__, f2, cache=cache)
     assert not f2.calls
+
+
+def test_one_ai_call_never_runs_past_its_time_budget():
+    import httpx
+    t = iter([0, 10, 200, 210, 220, 230])          # the first route alone took 190 s
+
+    class C:
+        def post(self, url, **k): return httpx.Response(500, request=httpx.Request("POST", url))
+    routes = [Route(n, "openai", f"https://x/{n}", "k", "m", 0, 100) for n in "abc"]
+    with pytest.raises(ProviderError) as e:
+        complete("s", "t", routes=routes, client=C(), sleep=lambda s: 0, clock=lambda: next(t))
+    assert e.value.rate_limited and "too long" in str(e.value)     # the job pauses instead of the run being killed

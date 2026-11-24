@@ -38,9 +38,11 @@ MAX_PAGES_REFERENCE_COPY = 30  # a longer scanned mark scheme / model answer is 
 WRITTEN_PAGE_MARGIN = 0.3    # a page is "written on" when it differs from the blank paper this much more than a
                              # typical untouched page does (mean grey-level difference, 0-255, at 160 px wide)
 WRITTEN_PAGE_INK = 3         # ...or has at least this many strongly changed pixels (ink) at that size
-RUN_BUDGET_SECONDS = 480     # the Action stops after 12 minutes: take no new job after 8, and pause a long paper
-                             # (pages read so far are kept in grader_cache) once the run is 9 minutes in
-JOB_BUDGET_SECONDS = 540
+RUN_BUDGET_SECONDS = 900     # the Action stops after 25 minutes: take no new job after 15, and pause a long paper
+                             # (pages read so far are kept in grader_cache) once the run is 18 minutes in; one AI call
+JOB_BUDGET_SECONDS = 1080    # takes at most CALL_BUDGET_SECONDS, so a paused run still ends well before the limit
+CALL_BUDGET_SECONDS = 150    # one AI call, every route and every 429 retry included (run #214 was cut off mid-call)
+REQUEST_TIMEOUT = 60         # one HTTP request to a provider
 MARK_PROMPT_CHARS = 9000     # a marking prompt longer than this (a long practice book) is split...
 MARK_BATCH_QUESTIONS = 1     # ...into batches of this many questions (Groq's free tier refused a 20-question one: 413,
                              # and cut a 3-question reply at its 1500-token output cap: one question per call fits)
