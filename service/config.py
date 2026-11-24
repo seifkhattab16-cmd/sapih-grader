@@ -42,7 +42,8 @@ RUN_BUDGET_SECONDS = 480     # the Action stops after 12 minutes: take no new jo
                              # (pages read so far are kept in grader_cache) once the run is 9 minutes in
 JOB_BUDGET_SECONDS = 540
 MARK_PROMPT_CHARS = 9000     # a marking prompt longer than this (a long practice book) is split...
-MARK_BATCH_QUESTIONS = 3     # ...into batches of this many questions (Groq's free tier refused a 20-question one: 413)
+MARK_BATCH_QUESTIONS = 1     # ...into batches of this many questions (Groq's free tier refused a 20-question one: 413,
+                             # and cut a 3-question reply at its 1500-token output cap: one question per call fits)
 RATE_LIMIT_RETRIES = 2      # a call refused with 429 by every route is tried again this many times...
 RATE_LIMIT_WAIT = 30         # ...after waiting the provider's Retry-After, at most this many seconds
 MIN_TEXT_PER_PAGE = 40       # fewer characters than this per page = a scan, send images instead
