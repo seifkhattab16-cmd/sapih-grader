@@ -372,9 +372,16 @@ def merge_transcripts(pages: list[list[dict]]) -> list[dict]:
     """Joins per-page transcriptions: one entry per question, in first-seen order; a question that runs over two pages
     keeps both parts (in page order); it is legible only if every part was."""
     out: dict[str, dict] = {}
+    last = ""                                     # the last question number seen, in page order
     for page in pages:
         for t in page:
             ref = re.sub(r"\s+", "", t["ref"]) or "?"
+            if re.match(r"\d", ref):
+                last = _lead(ref)
+            elif last:
+                # "b)" on a page whose question number is on the page before: a part of that question
+                # (seen live: parts became questions "a", "b)" with no model answer, marked against nothing).
+                ref = last + re.sub(r"[^a-z0-9]", "", ref.lower())
             if ref not in out:
                 out[ref] = {**t, "ref": ref}
                 continue
@@ -709,7 +716,13 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     p2 = prompt(ms.text, ma.text, student)
     batches = [None]
     if only_answered and len(p2) > C.MARK_PROMPT_CHARS:
-        leads = sorted(answered, key=_ref_order)
+        # Only questions the copied answers cover: one without a model answer would be marked against nothing.
+        covered = {_lead(q["ref"]) for name in kept for q in kept[name]}
+        leads = sorted(answered & covered, key=_ref_order)
+        missing = sorted(answered - covered, key=_ref_order)
+        if missing:
+            flags.append("no_answer_for_some")
+            pages_note += f"; not marked (no model answer found): {','.join(missing)}"
         batches = [leads[i:i + C.MARK_BATCH_QUESTIONS] for i in range(0, len(leads), C.MARK_BATCH_QUESTIONS)]
     all_q: list[QuestionGrade] = []
     overall: list[float] = []
@@ -731,6 +744,12 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                     return {"res": r.model_dump(), "flags": f_, "via": v_}
                 got = pages.get(f"mark:{work_url}:{','.join(b)}", make)
                 res, fl, vias = GradeResult.model_validate(got["res"]), got["flags"], got["via"]
+                if len(b) == 1:
+                    # Marking one question, the AI often numbers its parts "1a, 1b" whatever the question is (seen
+                    # live: every question came back as Q1 and was shown with Q1's working). They are this question.
+                    for q in res.questions:
+                        if _lead(q.ref) != b[0]:
+                            q.ref = b[0] + re.sub(r"^\s*(?:q(?:uestion)?\s*)?\d*", "", q.ref, flags=re.I).strip()
             all_q += res.questions
             overall.append(res.overall_confidence)
             flags.extend(fl)
@@ -740,7 +759,12 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                        flags=["bad_ai_reply"])
     res = GradeResult(questions=all_q, overall_confidence=min(overall))
     for q in res.questions:
-        t = next((x for x in transcript if _lead(x["ref"]) == _lead(q.ref)), None)
+        # The part's own transcription when the student's parts were read separately, else the whole question's.
+        exact = [x for x in transcript if re.sub(r"[^a-z0-9]", "", x["ref"].lower()) == re.sub(r"[^a-z0-9]", "", q.ref.lower())]
+        same = exact or [x for x in transcript if _lead(x["ref"]) == _lead(q.ref)]
+        t = {"transcription": "\n".join(x["transcription"] for x in same if x["transcription"]),
+             "sketch": "\n".join(x.get("sketch", "") for x in same if x.get("sketch")),
+             "legible": all(x["legible"] for x in same)} if same else None
         q.transcription = (t["transcription"] if t else typed)[:1500]
         q.legible = t["legible"] if t else True
         q.sketch = (t.get("sketch", "") if t else "")[:800]

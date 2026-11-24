@@ -853,3 +853,52 @@ def test_one_ai_call_never_runs_past_its_time_budget():
     with pytest.raises(ProviderError) as e:
         complete("s", "t", routes=routes, client=C(), sleep=lambda s: 0, clock=lambda: next(t))
     assert e.value.rate_limited and "too long" in str(e.value)     # the job pauses instead of the run being killed
+
+
+# ── Labels on a long paper (live draft 2026-11-24: every question came back as "Q1"; parts "a", "b)" stood alone) ──
+
+def test_parts_without_a_number_join_the_question_on_the_page_before():
+    m = grader_core.merge_transcripts([
+        [{"ref": "4", "transcription": "a) x=1", "sketch": "", "legible": True}],
+        [{"ref": "b)", "transcription": "y=2", "sketch": "", "legible": True},
+         {"ref": "c", "transcription": "z=3", "sketch": "", "legible": True}],
+        [{"ref": "5a", "transcription": "w", "sketch": "", "legible": True}]])
+    assert [t["ref"] for t in m] == ["4", "4b", "4c", "5a"]
+
+
+class OneLabelFake(BatchFake):
+    """A marker that numbers every question's parts '1a', '1b' whatever it was given."""
+    def __call__(self, system, text, images, want_out=3000, require_vision=False, trace=None, skip=None, **kw):
+        if not system.startswith("You are"):
+            return super().__call__(system, text, images, want_out, require_vision, trace, skip, **kw)
+        self.calls.append({"system": system[:8], "text": text})
+        refs = re.findall(r"^Q(\d+)", text.split("=== STUDENT WORK")[1], re.M)
+        qs = [{"ref": "1a", "max_marks": 2, "awarded_marks": 2, "feedback": "ok", "confidence": 0.9, "reason": "r",
+               "marks": [{"type": "M1", "awarded": True, "criterion": "m", "evidence": f"working for q{r}"},
+                         {"type": "A1", "awarded": True, "criterion": "a", "evidence": "x=2"}]} for r in refs[:1]]
+        return json.dumps({"questions": qs, "overall_confidence": 0.9}), ("m2" if skip else "m1")
+
+
+def test_a_one_question_batch_keeps_its_own_number_and_working(monkeypatch):
+    monkeypatch.setattr(grader_core.C, "MARK_PROMPT_CHARS", 10)
+    files = dict(BOOK, **{"https://f/two.pdf": book(8, ink=(3, 7))})
+    grader_core._COPIES.clear()
+    out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/two.pdf"}, files.__getitem__,
+                                       OneLabelFake(answers={3: "3", 7: "7"}), cache={})
+    assert [q["ref"] for q in out.questions] == ["3a", "7a"]
+    assert "q3" in out.questions[0]["transcription"] and "q7" in out.questions[1]["transcription"]
+
+
+def test_a_question_with_no_model_answer_is_not_marked_against_nothing(monkeypatch):
+    monkeypatch.setattr(grader_core.C, "MARK_PROMPT_CHARS", 10)
+
+    class NoQ7(BatchFake):
+        def __call__(self, system, text, images, *a, **kw):
+            if system.startswith("You copy") and "Page 7 " in text:
+                return json.dumps({"questions": []}), "vision"
+            return super().__call__(system, text, images, *a, **kw)
+    files = dict(BOOK, **{"https://f/two.pdf": book(8, ink=(3, 7))})
+    grader_core._COPIES.clear()
+    out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/two.pdf"}, files.__getitem__,
+                                       NoQ7(answers={3: "3", 7: "7"}), cache={})
+    assert [q["ref"] for q in out.questions] == ["3"] and "no model answer found): 7" in out.note
