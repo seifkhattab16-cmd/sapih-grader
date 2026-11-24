@@ -804,3 +804,40 @@ def test_run_once_continues_only_after_progress():
     assert not should_continue(s)                                   # paused with nothing read: do not loop
     s.cache_writes = 3
     assert should_continue(s)
+
+
+# ── Long papers are marked a few questions at a time (Groq refused a 20-question marking request: 413) ──
+
+class BatchFake(BookFake):
+    """Marker marks exactly the questions whose student work is in its prompt."""
+    def __call__(self, system, text, images, want_out=3000, require_vision=False, trace=None, skip=None, **kw):
+        if not system.startswith("You are"):
+            return super().__call__(system, text, images, want_out, require_vision, trace, skip, **kw)
+        self.calls.append({"system": system[:8], "images": 0, "rv": require_vision, "text": text})
+        work = text.split("=== STUDENT WORK")[1]
+        refs = re.findall(r"^Q(\d+):", work, re.M)
+        qs = [{"ref": r, "max_marks": 2, "awarded_marks": 2, "feedback": "ok", "confidence": 0.9, "reason": "r",
+               "marks": [{"type": "M1", "awarded": True, "criterion": "m", "evidence": f"working for q{r}"},
+                         {"type": "A1", "awarded": True, "criterion": "a", "evidence": "x=2"}]} for r in refs]
+        return json.dumps({"questions": qs, "overall_confidence": 0.9}), ("m2" if skip else "m1")
+
+
+def test_a_long_paper_is_marked_in_batches_and_the_batches_are_cached(monkeypatch):
+    monkeypatch.setattr(grader_core.C, "MARK_PROMPT_CHARS", 10)
+    monkeypatch.setattr(grader_core.C, "MARK_BATCH_QUESTIONS", 2)
+    files = dict(BOOK, **{"https://f/many.pdf": book(8, ink=(1, 2, 3, 5, 7))})
+    answers = {1: "1", 2: "2", 3: "3", 5: "5", 7: "7"}
+    grader_core._COPIES.clear()
+    cache = {}
+    f = BatchFake(answers=answers)
+    out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/many.pdf"}, files.__getitem__, f, cache=cache)
+    assert out.status == "graded" and out.total_awarded == 10 and out.total_max == 10
+    markers = [c for c in f.calls if c["system"].startswith("You are") and "STUDENT WORK" in c["text"]]
+    assert len(markers) == 6                                        # 3 batches (1,2 / 3,5 / 7) x 2 markers
+    first = markers[0]["text"]
+    assert "Question 1:" in first and "Question 2:" in first and "Question 3:" not in first   # only its questions
+    assert [q["ref"] for q in out.questions] == ["1", "2", "3", "5", "7"]
+    grader_core._COPIES.clear()
+    f2 = BatchFake(answers=answers)                                 # a resumed run: nothing is marked twice
+    grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/many.pdf"}, files.__getitem__, f2, cache=cache)
+    assert not f2.calls

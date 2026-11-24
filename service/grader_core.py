@@ -467,6 +467,12 @@ def copy_reference(key: str, m: Material, complete, trace: list[str], pages: "_P
     return _COPIES[key]
 
 
+def _ref_order(r: str):
+    """Question numbers in reading order: 2 before 10 (and 4a before 4b)."""
+    m = re.match(r"\s*(\d+)(.*)", str(r))
+    return (int(m.group(1)), m.group(2)) if m else (10**6, str(r))
+
+
 def _lead(ref: str) -> str:
     m = re.match(r"\s*(\d+)", str(ref))
     return m.group(1) if m else str(ref)
@@ -617,7 +623,9 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     # student did part of is not marked 0 on every question they were not set. A short scan stays as pictures.
     answered = {_lead(t["ref"]) for t in transcript if t["transcription"] or t.get("sketch")}
     only_answered = False
-    for key, m in ((assignment.get("markingSchemeUrl") or "", ms), (assignment.get("modelAnswerUrl") or "", ma)):
+    kept: dict[str, list[dict]] = {}              # "ms" / "ma" -> the copied questions given to the marker
+    for name, key, m in (("ms", assignment.get("markingSchemeUrl") or "", ms),
+                         ("ma", assignment.get("modelAnswerUrl") or "", ma)):
         if not m.images or len(m.images) <= C.MAX_PAGES_REFERENCE:
             continue
         copied = copy_reference(key, m, complete, trace, pages)
@@ -626,71 +634,111 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
             continue
         keep = [q for q in copied if _lead(q["ref"]) in answered] if answered else []
         only_answered |= bool(keep)
-        m.text = "\n\n".join(f"Question {q['ref']}:\n{q['text']}" for q in (keep or copied))
+        kept[name] = keep or copied
+        m.text = "\n\n".join(f"Question {q['ref']}:\n{q['text']}" for q in kept[name])
         m.images = []
     if only_answered:
         pages_note = "; ".join(x for x in (pages_note, "marked the questions answered: "
-                                           + ",".join(sorted(answered, key=lambda r: (len(r), r)))) if x)
+                                           + ",".join(sorted(answered, key=_ref_order))) if x)
 
-    # Stage 2: mark from the transcription, with two different models.
-    p2 = (f"Assignment: {assignment.get('title', '')}\n\n"
-          + (f"=== QUESTIONS ===\n{questions}\n" if questions else "") + block("MARK SCHEME", ms, ms_notes)
-          + block("MODEL ANSWER", ma, ma_notes) + guidance_block(guidance)
-          + "\n=== STUDENT WORK (transcribed) ===\n" + student
-          + ("\nMark each question given in the mark scheme / model answer above (the student answered these questions "
-             "of a longer paper)." if only_answered else
-             "\nMark every question in the mark scheme (0 for anything not written).")
-          + " Use the mark scheme's own marks per question. Respond with JSON of this shape:\n" + MARK_SCHEMA)
+    def prompt(ms_text: str, ma_text: str, student_text: str) -> str:
+        return (f"Assignment: {assignment.get('title', '')}\n\n"
+                + (f"=== QUESTIONS ===\n{questions}\n" if questions else "")
+                + block("MARK SCHEME", Material(text=ms_text, images=ms.images), ms_notes)
+                + block("MODEL ANSWER", Material(text=ma_text, images=ma.images), ma_notes) + guidance_block(guidance)
+                + "\n=== STUDENT WORK (transcribed) ===\n" + student_text
+                + ("\nMark each question given in the mark scheme / model answer above (the student answered these "
+                   "questions of a longer paper)." if only_answered else
+                   "\nMark every question in the mark scheme (0 for anything not written).")
+                + " Use the mark scheme's own marks per question. Respond with JSON of this shape:\n" + MARK_SCHEMA)
+
     mark_images = ms.images + ma.images          # only non-empty if the scheme itself is a scan
-    try:
+
+    def run_markers(p2: str, wt: str) -> tuple[GradeResult, list[str], list[str]]:
+        """Two markers (a third breaks a tie) on one prompt. Returns (result, flags, models used)."""
+        fl: list[str] = []
         res, via2 = _ask(complete, MARK_SYSTEM, p2, mark_images, parse_reply, trace, require_vision=bool(mark_images))
+        vias = [via2]
+        try:
+            res2, via3 = _ask(complete, MARK_SYSTEM, p2, mark_images, parse_reply, trace,
+                              require_vision=bool(mark_images), skip=[via2])
+            vias.append(via3)
+        except Exception:
+            res2, via3 = None, ""                # no second model available: single marker, flagged
+            fl.append("single_marker")
+        changed = False
+        for q in res.questions:
+            if verify_evidence(q, wt):
+                fl.append("evidence_not_found")
+            changed |= reconcile(q)
+        if changed:
+            fl.append("marks_recomputed")
+        if res2:
+            for q2 in res2.questions:
+                verify_evidence(q2, wt)
+                reconcile(q2)
+            alt = {_lead(q.ref): q for q in res2.questions}
+            disagree = [q for q in res.questions
+                        if alt.get(_lead(q.ref)) is not None and alt[_lead(q.ref)].awarded_marks != q.awarded_marks]
+            if disagree:
+                fl.append("markers_disagree")
+                alt3, via4 = {}, ""
+                try:                              # a third, different model breaks the tie
+                    res3, via4 = _ask(complete, MARK_SYSTEM, p2, mark_images, parse_reply, trace,
+                                      require_vision=bool(mark_images), skip=[via2, via3])
+                    for q3 in res3.questions:
+                        verify_evidence(q3, wt)
+                        reconcile(q3)
+                    alt3 = {_lead(q.ref): q for q in res3.questions}
+                    vias.append(via4)
+                except Exception:
+                    pass
+                for q in disagree:
+                    o, t = alt[_lead(q.ref)], alt3.get(_lead(q.ref))
+                    vals = [q.awarded_marks, o.awarded_marks] + ([t.awarded_marks] if t else [])
+                    new = sorted(vals)[1] if t else min(vals)       # median of three, else the lower mark
+                    q.reason = (q.reason + f" | Markers gave {vals} ({via2}, {via3}" + (f", {via4}" if t else "")
+                                + f"); used {new}.").strip(" |")
+                    q.awarded_marks = new
+                    q.confidence = min(q.confidence, 0.5)
+        return res, fl, vias
+
+    # Stage 2: mark from the transcription, with two different models. A long paper whose answers were copied is
+    # marked a few questions at a time (free models refuse a large request: Groq answered 413 on a 20-question
+    # practice book); each batch is cached like a page, so a paused paper does not mark a batch twice.
+    p2 = prompt(ms.text, ma.text, student)
+    batches = [None]
+    if only_answered and len(p2) > C.MARK_PROMPT_CHARS:
+        leads = sorted(answered, key=_ref_order)
+        batches = [leads[i:i + C.MARK_BATCH_QUESTIONS] for i in range(0, len(leads), C.MARK_BATCH_QUESTIONS)]
+    all_q: list[QuestionGrade] = []
+    overall: list[float] = []
+    try:
+        for b in batches:
+            if b is None:
+                res, fl, vias = run_markers(p2, work_text)
+            else:
+                part = [t for t in transcript if _lead(t["ref"]) in b]
+                text_b = "\n".join(f"Q{t['ref']}: {t['transcription'] or '(nothing written)'}"
+                                   + (f"\n  [sketch drawn: {t['sketch']}]" if t.get("sketch") else "") for t in part)
+                wt_b = "\n".join("\n".join(x for x in (t["transcription"], t.get("sketch", "")) if x) for t in part)
+                sub = lambda name, m: ("\n\n".join(f"Question {q['ref']}:\n{q['text']}" for q in kept[name]
+                                                    if _lead(q["ref"]) in b) if name in kept else m.text)
+
+                def make(b=b, text_b=text_b, wt_b=wt_b, sub=sub):
+                    r, f_, v_ = run_markers(prompt(sub("ms", ms), sub("ma", ma), f"Transcribed handwriting:\n{text_b}\n"),
+                                            wt_b)
+                    return {"res": r.model_dump(), "flags": f_, "via": v_}
+                got = pages.get(f"mark:{work_url}:{','.join(b)}", make)
+                res, fl, vias = GradeResult.model_validate(got["res"]), got["flags"], got["via"]
+            all_q += res.questions
+            overall.append(res.overall_confidence)
+            flags.extend(fl)
+            via_all.extend(v for v in vias if v and v not in via_all)
     except ValueError as e:
         return Outcome(status="needs_teacher", note=f"bad_ai_reply: {e}. Tried: " + "; ".join(trace)[:250],
                        flags=["bad_ai_reply"])
-    via_all.append(via2)
-    try:
-        res2, via3 = _ask(complete, MARK_SYSTEM, p2, mark_images, parse_reply, trace, require_vision=bool(mark_images),
-                          skip=[via2])
-        via_all.append(via3)
-    except Exception:
-        res2, via3 = None, ""                    # no second model available: single marker, flagged
-        flags.append("single_marker")
-
-    changed = False
-    for q in res.questions:
-        if verify_evidence(q, work_text):
-            flags.append("evidence_not_found")
-        changed |= reconcile(q)
-    if changed:
-        flags.append("marks_recomputed")
-    if res2:
-        for q2 in res2.questions:
-            verify_evidence(q2, work_text)
-            reconcile(q2)
-        alt = {_lead(q.ref): q for q in res2.questions}
-        disagree = [q for q in res.questions
-                    if alt.get(_lead(q.ref)) is not None and alt[_lead(q.ref)].awarded_marks != q.awarded_marks]
-        if disagree:
-            flags.append("markers_disagree")
-            alt3, via4 = {}, ""
-            try:                                  # a third, different model breaks the tie
-                res3, via4 = _ask(complete, MARK_SYSTEM, p2, mark_images, parse_reply, trace,
-                                  require_vision=bool(mark_images), skip=[via2, via3])
-                for q3 in res3.questions:
-                    verify_evidence(q3, work_text)
-                    reconcile(q3)
-                alt3 = {_lead(q.ref): q for q in res3.questions}
-                via_all.append(via4)
-            except Exception:
-                pass
-            for q in disagree:
-                o, t = alt[_lead(q.ref)], alt3.get(_lead(q.ref))
-                vals = [q.awarded_marks, o.awarded_marks] + ([t.awarded_marks] if t else [])
-                new = sorted(vals)[1] if t else min(vals)       # median of three, else the lower mark
-                q.reason = (q.reason + f" | Markers gave {vals} ({via2}, {via3}" + (f", {via4}" if t else "")
-                            + f"); used {new}.").strip(" |")
-                q.awarded_marks = new
-                q.confidence = min(q.confidence, 0.5)
+    res = GradeResult(questions=all_q, overall_confidence=min(overall))
     for q in res.questions:
         t = next((x for x in transcript if _lead(x["ref"]) == _lead(q.ref)), None)
         q.transcription = (t["transcription"] if t else typed)[:1500]

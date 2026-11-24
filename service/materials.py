@@ -90,15 +90,20 @@ def written_pages(work: bytes, blank: bytes, margin: float = C.WRITTEN_PAGE_MARG
     try:
         if len(a) < 2 or len(a) != len(b):
             return None
-        scores = []
+        scores, inked = [], []
         for pa, pb in zip(a, b):
             wa, ha, x = _grey(pa)
             wb, hb, y = _grey(pb)
             if (wa, ha) != (wb, hb):
                 return None
-            scores.append(sum(abs(p - q) for p, q in zip(x, y)) / max(1, len(x)))
-        typical = sorted(scores)[len(scores) // 2]
-        return [i for i, s in enumerate(scores) if s - typical > margin]
+            d = [abs(p - q) for p, q in zip(x, y)]
+            scores.append(sum(d) / max(1, len(d)))
+            inked.append(sum(1 for v in d if v > 60))
+        # Re-saving shifts every page a little and evenly (about 1.1 on a 50-page book), so the cleanest page is the
+        # baseline: the median would be a written page when the student wrote on most of them. Clear ink (strongly
+        # changed pixels) also counts, so a page is never missed because every page was written on.
+        clean = min(scores)
+        return [i for i, s in enumerate(scores) if s - clean > margin or inked[i] >= C.WRITTEN_PAGE_INK]
     except Exception:
         return None
     finally:
