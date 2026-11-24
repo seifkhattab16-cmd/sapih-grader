@@ -1053,3 +1053,11 @@ def test_the_marker_can_give_the_correct_working_for_a_lost_mark():
     assert len(res.questions[0].correct_working) == 4                  # at most 4 lines, blanks dropped
     assert res.questions[1].correct_working == ["$y = 3$", "$x = 930$"]  # a string is split into lines
     assert "correct_working" in grader_core.MARK_SCHEMA and "16-year-old" in grader_core.MARK_SYSTEM
+
+
+def test_the_transcriber_says_where_each_answer_starts():
+    got = grader_core._parse_page(json.dumps({"questions": [
+        {"ref": "1a", "transcription": "x", "top": 0.42}, {"ref": "1b", "transcription": "y", "top": "1.7"},
+        {"ref": "1c", "transcription": "z"}]}))
+    assert [t["top"] for t in got] == [0.42, None, None]
+    assert '"top"' in grader_core.TRANSCRIBE_SCHEMA

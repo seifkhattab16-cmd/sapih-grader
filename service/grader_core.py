@@ -90,6 +90,8 @@ class QuestionGrade(BaseModel):
     steps: list[ProofStep] = []          # proofs only
     features: list[SketchFeature] = []   # sketches only
     sketch: str = ""                     # the transcriber's neutral description of a drawn graph, if any
+    top: Optional[float] = None          # R2.1: where on its page the answer starts (0 top .. 1 bottom)
+    page: Optional[int] = None           # R2.1: the page of the student's file that position is on
     correct_working: list[str] = []      # R4.1: the right lines (LaTeX) when marks were lost, for the marked PDF
 
     @field_validator("correct_working", mode="before")
@@ -214,7 +216,8 @@ TRANSCRIBE_SYSTEM = (
     "Reply with ONLY one JSON object, no prose."
 )
 TRANSCRIBE_SCHEMA = ('{"questions":[{"ref":"1","transcription":"<exactly what the student wrote>",'
-                     '"sketch":"<what is drawn, or empty>","legible":true|false}]}')
+                     '"sketch":"<what is drawn, or empty>","legible":true|false,'
+                     '"top":<where on the page this answer starts: 0 = top edge, 1 = bottom edge>}]}')
 
 MARK_SYSTEM = (
     "You are a strict maths examiner (Edexcel style: M = method, A = accuracy, B = independent mark). You mark ONLY "
@@ -375,7 +378,16 @@ def _parse_transcription(text: str, allow_empty: bool = False) -> list[dict]:
         raise ValueError("no questions in transcription")
     return [{"ref": str(q.get("ref", "?")), "transcription": str(q.get("transcription") or "").strip(),
              "sketch": str(q.get("sketch") or "").strip(),
-             "legible": bool(q.get("legible", True))} for q in qs if isinstance(q, dict)]
+             "legible": bool(q.get("legible", True)), "top": _frac(q.get("top"))} for q in qs if isinstance(q, dict)]
+
+
+def _frac(v) -> float | None:
+    """R2.1: a position on the page (0 top .. 1 bottom), or None when missing or out of range."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(f, 3) if 0 <= f <= 1 else None
 
 
 def _parse_page(text: str) -> list[dict]:
@@ -649,7 +661,7 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                         r"[()\s]", "", re.sub(r"^\s*(?:q(?:uestion)?\s*)?\d*", "", str(t["ref"]), flags=re.I)).lower()}
                        for t in got]
             read_ok += 1
-            per_page.append(got)
+            per_page.append([{**t, "page": pno} for t in got])    # R2.1: which page the answer (and its `top`) is on
             if via1 not in via_all:
                 via_all.append(via1)
         if not read_ok:
@@ -851,6 +863,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         q.transcription = (t["transcription"] if t else typed)[:1500]
         q.legible = t["legible"] if t else True
         q.sketch = (t.get("sketch", "") if t else "")[:800]
+        first = same[0] if same else {}
+        q.top, q.page = first.get("top"), first.get("page")   # R2.1: where the marked PDF puts this part's tick
         if q.awarded_marks >= q.max_marks:
             q.correct_working = []                # full marks: nothing to correct on the marked PDF
         flags.extend(check_work_type(q, work_text, q.sketch, qtexts.get(_lead(q.ref), "")))
