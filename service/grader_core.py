@@ -13,7 +13,7 @@ import time
 from typing import Callable, Optional
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from . import config as C
-from .materials import Material, read_document, is_file_ref, written_pages
+from .materials import Material, read_document, is_file_ref, written_pages, booklet_manifest
 from .providers import ProviderError, complete as default_complete
 
 LOW_CONFIDENCE = 0.6
@@ -526,6 +526,10 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     qp_bytes = _fetch(qp_url, fetch)
     work_url = submission.get("fileUrl") or ""
     work, matched, pages_note = _student_work(work_url, fetch, qp_bytes)
+    # R1.1: a generated booklet says which bank question is on every page (used for marking in R1.2).
+    booklet = booklet_manifest(qp_bytes)
+    if booklet and matched:
+        pages_note = "; ".join(x for x in (pages_note, f"booklet: {len(booklet['q'])} bank questions on known pages") if x)
     if not typed and pages_note.startswith("no_writing"):
         return Outcome(status="needs_teacher", note=pages_note, flags=["unreadable_work"])
     if not typed and not work.readable:

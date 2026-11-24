@@ -902,3 +902,34 @@ def test_a_question_with_no_model_answer_is_not_marked_against_nothing(monkeypat
     out = grader_core.grade_submission(BOOK_A, {"fileUrl": "https://f/two.pdf"}, files.__getitem__,
                                        NoQ7(answers={3: "3", 7: "7"}), cache={})
     assert [q["ref"] for q in out.questions] == ["3"] and "no model answer found): 7" in out.note
+
+
+# --- Marked-work R1.1: a generated booklet lists its bank questions and pages in the PDF Subject ---
+from service.materials import booklet_manifest, questions_on_page, MANIFEST_PREFIX
+
+
+def _pdf_with_subject(subject: str, pages: int = 3) -> bytes:
+    d = pymupdf.open()
+    for _ in range(pages):
+        d.new_page()
+    d.set_metadata({"subject": subject})
+    return d.tobytes()
+
+
+def test_booklet_manifest_is_read_from_the_question_paper():
+    m = {"v": 1, "unit": "P1", "pages": 6, "q": [{"n": 1, "id": "a", "marks": 6, "page": 2, "solve": []},
+                                                 {"n": 2, "id": "b", "marks": 12, "page": 2, "solve": [3]}]}
+    got = booklet_manifest(_pdf_with_subject(MANIFEST_PREFIX + json.dumps(m)))
+    assert got == m
+    assert [q["id"] for q in questions_on_page(got, 1)] == ["a", "b"]   # 0-based page 1 = PDF page 2
+    assert [q["id"] for q in questions_on_page(got, 2)] == ["b"]        # its answer sheet
+    assert questions_on_page(got, 0) == []                              # the cover
+
+
+def test_other_files_have_no_booklet_manifest():
+    assert booklet_manifest(_pdf_with_subject("pure mathematics 1 (Questions)")) is None
+    assert booklet_manifest(_pdf_with_subject(MANIFEST_PREFIX + "{broken")) is None
+    assert booklet_manifest(_pdf_with_subject(MANIFEST_PREFIX + json.dumps({"v": 2, "q": []}))) is None
+    assert booklet_manifest(b"not a pdf") is None
+    assert booklet_manifest(None) is None
+    assert questions_on_page(None, 0) == []

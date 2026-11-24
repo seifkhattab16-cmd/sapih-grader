@@ -2,6 +2,7 @@
 A file name or title is never used as work: if nothing readable comes out, the caller must not grade."""
 from __future__ import annotations
 import base64
+import json
 from urllib.parse import quote
 from dataclasses import dataclass, field
 import httpx
@@ -9,6 +10,36 @@ import pymupdf
 from . import config as C
 
 MAX_BYTES = 25 * 1024 * 1024
+MANIFEST_PREFIX = "saiph-booklet:"
+
+
+def booklet_manifest(pdf: bytes | None) -> dict | None:
+    """Marked-work R1.1: a question paper made by the portal's booklet generator lists its bank questions in the PDF
+    Subject ("saiph-booklet:" + JSON, see the portal's src/utils/bookletManifest.js):
+    {"v": 1, "unit": "P1", "pages": 50, "q": [{"n": 1, "id": "<bank id>", "marks": 6, "page": 2, "solve": [3]}, ...]}
+    page / solve are 1-based PDF pages. None for any other file (an uploaded paper, a photo, a damaged list)."""
+    if not pdf or pdf[:4] != b"%PDF":
+        return None
+    try:
+        with pymupdf.open(stream=pdf, filetype="pdf") as d:
+            subject = (d.metadata or {}).get("subject") or ""
+    except Exception:
+        return None
+    if not subject.startswith(MANIFEST_PREFIX):
+        return None
+    try:
+        m = json.loads(subject[len(MANIFEST_PREFIX):])
+    except ValueError:
+        return None
+    if not isinstance(m, dict) or m.get("v") != 1 or not isinstance(m.get("q"), list):
+        return None
+    return m
+
+
+def questions_on_page(manifest: dict | None, page: int) -> list[dict]:
+    """The booklet questions printed or answered on 0-based page `page` (its own page or one of its answer sheets)."""
+    p = page + 1
+    return [q for q in (manifest or {}).get("q", []) if q.get("page") == p or p in (q.get("solve") or [])]
 
 
 @dataclass
