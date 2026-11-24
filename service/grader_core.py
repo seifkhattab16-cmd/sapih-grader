@@ -591,9 +591,14 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                      "student's work)" if matched else "")
                   + ". Transcribe the student's answer to every question the student wrote on, on this page. Leave out "
                     "questions with nothing written by the student. Nothing written by the student on this page: "
-                    '{"questions": []}.\nRespond with JSON of this shape:\n' + TRANSCRIBE_SCHEMA)
+                    '{"questions": []}.\n`ref` is the question NUMBER PRINTED on this page (e.g. a bold "4." at the '
+                    "start of the question) followed by the part the student is answering, e.g. \"4a\", \"4b\". The "
+                    "student's own labels (\"a)\", \"B)\") give only the part: never leave the number out when it is "
+                    "printed on the page. Only when no question number is visible on the page, give the part alone."
+                    "\nRespond with JSON of this shape:\n" + TRANSCRIBE_SCHEMA)
             try:
-                got, via1 = pages.get(f"page:{work_url}:{pno}:{int(matched)}", lambda: list(_ask(
+                # v2: the printed question number is asked for (v1 pages came back as bare "a)", "B)" parts).
+                got, via1 = pages.get(f"page:v2:{work_url}:{pno}:{int(matched)}", lambda: list(_ask(
                     complete, TRANSCRIBE_SYSTEM, p1, [img] + ([] if matched else qp.images), _parse_page, trace,
                     require_vision=True)))
             except (ValueError, ProviderError):
@@ -742,7 +747,7 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                     r, f_, v_ = run_markers(prompt(sub("ms", ms), sub("ma", ma), f"Transcribed handwriting:\n{text_b}\n"),
                                             wt_b)
                     return {"res": r.model_dump(), "flags": f_, "via": v_}
-                got = pages.get(f"mark:{work_url}:{','.join(b)}", make)
+                got = pages.get(f"mark:v2:{work_url}:{','.join(b)}", make)
                 res, fl, vias = GradeResult.model_validate(got["res"]), got["flags"], got["via"]
                 if len(b) == 1:
                     # Marking one question, the AI often numbers its parts "1a, 1b" whatever the question is (seen
