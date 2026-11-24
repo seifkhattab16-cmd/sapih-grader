@@ -70,6 +70,18 @@ class Store:
             row["_quiz"] = self._quiz_paper(row)
         return row
 
+    def bank_questions(self, ids: list[str]) -> dict[str, dict]:
+        """Marked-work R1.2: a booklet's bank questions with their own mark scheme and model answer (service key)."""
+        out: dict[str, dict] = {}
+        ids = [i for i in dict.fromkeys(ids) if i]
+        for k in range(0, len(ids), 50):
+            r = self.c.get(self._u("question_bank"), headers=self._h(),
+                           params={"select": "id,marks,stem,mark_scheme,model_answer", "id": f"in.({','.join(ids[k:k + 50])})"})
+            r.raise_for_status()
+            for row in r.json() or []:
+                out[row["id"]] = row
+        return out
+
     def _one(self, table: str, **eq) -> dict | None:
         r = self.c.get(self._u(table), headers=self._h(), params={**{k: f"eq.{v}" for k, v in eq.items()}, "limit": "1"})
         r.raise_for_status()

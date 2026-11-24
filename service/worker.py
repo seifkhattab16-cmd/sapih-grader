@@ -121,7 +121,7 @@ def process_one(store, fetch: Callable[[str], bytes] = fetch_bytes, complete: Ca
         cache = store.cache() if hasattr(store, "cache") else None
         out = grader_core.grade_submission(assignment, sub.get("data") or {}, fetch, complete,
                                            guidance=guidance_for(store, job, sub), cache=cache,
-                                           deadline=deadline, clock=clock)
+                                           deadline=deadline, clock=clock, bank=getattr(store, "bank_questions", None))
         if out.status == "graded":
             store.save_grade(job, sub, out)
             store.finish(job["id"], "done", (",".join(out.flags) + " | " + out.note)[:500])

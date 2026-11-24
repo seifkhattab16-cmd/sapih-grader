@@ -933,3 +933,79 @@ def test_other_files_have_no_booklet_manifest():
     assert booklet_manifest(b"not a pdf") is None
     assert booklet_manifest(None) is None
     assert questions_on_page(None, 0) == []
+
+
+# --- Marked-work R1.2: a booklet is marked against each question's own bank mark scheme ---
+from service.booklet import booklet_references, scheme_lines, answer_lines
+
+
+def _booklet(n: int, manifest: dict, ink: tuple = ()) -> bytes:
+    d = pymupdf.open(stream=book(n, ink=ink), filetype="pdf")
+    d.set_metadata({"subject": MANIFEST_PREFIX + json.dumps(manifest)})
+    return d.tobytes()
+
+
+MANI = {"v": 1, "unit": "P1", "pages": 4, "q": [{"n": 1, "id": "id1", "marks": 3, "page": 2, "solve": []},
+                                                {"n": 2, "id": "id2", "marks": 4, "page": 3, "solve": [4]}]}
+ROWS = {"id1": {"id": "id1", "marks": 3, "stem": "Find sin x.",
+                "mark_scheme": [{"part": "(a)", "markType": "M1", "answer": "sine rule", "notes": ""},
+                                {"part": "(a)", "markType": "A1", "answer": "0.548", "notes": "awrt"},
+                                {"part": "(b)", "markType": "B1", "answer": "2.56", "notes": ""}],
+                "model_answer": [{"part": "(a)", "marks": "M1 A1", "answer": "0.548", "working": "8 sin 0.5 / 7"}]},
+        "id2": {"id": "id2", "marks": 4, "stem": "A question with nothing stored", "mark_scheme": [], "model_answer": None}}
+BK = {"https://f/bk.pdf": _booklet(4, MANI), "https://f/bk-omar.pdf": _booklet(4, MANI, ink=(2, 4))}
+
+
+class BookletFake:
+    """Transcriber: page 2 gives bare parts, page 4 a wrong number; marker: full marks on what it is given."""
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, system, text, images, want_out=3000, require_vision=False, trace=None, skip=None, **kw):
+        self.calls.append({"system": system[:8], "text": text})
+        page = int((re.search(r"[Pp]age (\d+) of the", text) or [0, 0])[1])
+        if system.startswith("You transcribe"):
+            refs = {2: ["a)", "b)"], 4: ["7"]}.get(page, [])
+            return json.dumps({"questions": [{"ref": r, "transcription": f"x=2 for {r}", "legible": True} for r in refs]}), "vision"
+        leads = sorted(set(re.findall(r"Question (\d+):", text)))   # named in both the scheme and the answer
+        qs = [{"ref": f"{n}a", "max_marks": 2, "awarded_marks": 2, "feedback": "ok", "confidence": 0.9, "reason": "r",
+               "marks": [{"type": "M1", "awarded": True, "criterion": "m", "evidence": "x=2"},
+                         {"type": "A1", "awarded": True, "criterion": "a", "evidence": "x=2"}]} for n in leads]
+        return json.dumps({"questions": qs, "overall_confidence": 0.9}), ("m2" if skip else "m1")
+
+
+def test_scheme_and_answer_lines_read_the_bank_format():
+    assert scheme_lines(ROWS["id1"]["mark_scheme"]).splitlines() == ["(a) M1: sine rule", "(a) A1: 0.548 (awrt)", "(b) B1: 2.56"]
+    assert answer_lines(ROWS["id1"]["model_answer"]) == "(a) [M1 A1] Answer: 0.548\n8 sin 0.5 / 7"
+    refs = booklet_references(MANI, ROWS)
+    assert refs["1"]["marks"] == 3 and refs["1"]["ms"].startswith("[3 marks] Find sin x.\nMark scheme:")
+    assert "Find sin x." not in refs["1"]["ma"]                  # the question text goes once
+    assert refs["2"]["ms"] == "" and refs["2"]["ma"] == ""        # nothing stored: never marked against nothing
+
+
+def test_a_booklet_is_marked_against_its_own_bank_scheme():
+    grader_core._COPIES.clear()
+    f = BookletFake()
+    asked = []
+    bank = lambda ids: (asked.append(ids), ROWS)[1]
+    out = grader_core.grade_submission({"title": "Booklet", "fileUrl": "https://f/bk.pdf"},   # no MS / MA files at all
+                                       {"fileUrl": "https://f/bk-omar.pdf"}, BK.__getitem__, f, bank=bank)
+    assert asked == [["id1", "id2"]]
+    reads = [c for c in f.calls if c["system"].startswith("You tran")]
+    assert "belongs to question 1 of the booklet" in reads[0]["text"]
+    assert "belongs to question 2 of the booklet" in reads[1]["text"]          # its answer sheet (page 4)
+    markers = [c for c in f.calls if c["system"].startswith("You are")]
+    assert markers and all("Question 1:" in c["text"] for c in markers)        # only Q1 has a stored scheme
+    assert "(a) A1: 0.548 (awrt)" in markers[0]["text"] and "8 sin 0.5 / 7" in markers[0]["text"]
+    assert "Q1a: x=2 for a)" in markers[0]["text"]                             # bare "a)" filed under question 1
+    assert out.status == "graded" and out.total_max == 2 and {q["ref"] for q in out.questions} == {"1a"}
+    assert "no_answer_for_some" in out.flags
+    assert "not marked (no stored mark scheme in the bank): 2" in out.note     # the wrong "7" became question 2
+    assert "booklet: 2 bank questions on known pages, 1 with a stored mark scheme" in out.note
+
+
+def test_a_booklet_without_bank_access_falls_back_to_the_assignment_files():
+    grader_core._COPIES.clear()
+    out = grader_core.grade_submission({"title": "Booklet", "fileUrl": "https://f/bk.pdf"},
+                                       {"fileUrl": "https://f/bk-omar.pdf"}, BK.__getitem__, BookletFake(), bank=None)
+    assert out.status == "needs_teacher" and out.note.startswith("no_scheme")

@@ -13,7 +13,8 @@ import time
 from typing import Callable, Optional
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from . import config as C
-from .materials import Material, read_document, is_file_ref, written_pages, booklet_manifest
+from .materials import Material, read_document, is_file_ref, written_pages, booklet_manifest, questions_on_page
+from .booklet import booklet_references
 from .providers import ProviderError, complete as default_complete
 
 LOW_CONFIDENCE = 0.6
@@ -511,7 +512,8 @@ def guidance_block(guidance: dict | None) -> str:
 
 def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], bytes],
                      complete: Callable = default_complete, guidance: dict | None = None,
-                     cache=None, deadline: float | None = None, clock: Callable[[], float] = time.monotonic) -> Outcome:
+                     cache=None, deadline: float | None = None, clock: Callable[[], float] = time.monotonic,
+                     bank: Callable[[list[str]], dict] | None = None) -> Outcome:
     """assignment / submission are the `data` JSON of their rows.
 
     Two stages, so that seeing and judging are separate (a single call kept 'explaining away' wrong working to
@@ -526,10 +528,23 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     qp_bytes = _fetch(qp_url, fetch)
     work_url = submission.get("fileUrl") or ""
     work, matched, pages_note = _student_work(work_url, fetch, qp_bytes)
-    # R1.1: a generated booklet says which bank question is on every page (used for marking in R1.2).
-    booklet = booklet_manifest(qp_bytes)
-    if booklet and matched:
-        pages_note = "; ".join(x for x in (pages_note, f"booklet: {len(booklet['q'])} bank questions on known pages") if x)
+    # R1.1: a generated booklet says which bank question is on every page. R1.2: each answered question is then marked
+    # against that question's own mark scheme and model answer from the bank, not a scanned model answer.
+    booklet = booklet_manifest(qp_bytes) if matched else None
+    refs: dict[str, dict] = {}
+    if booklet:
+        rows = {}
+        if bank:
+            try:
+                rows = bank([q.get("id") for q in booklet["q"]]) or {}
+            except Exception:
+                rows = {}                         # the bank could not be read: fall back to the assignment's files
+        refs = booklet_references(booklet, rows) if rows else {}
+        with_scheme = sum(1 for r in refs.values() if r["ms"] or r["ma"])
+        pages_note = "; ".join(x for x in (pages_note, f"booklet: {len(booklet['q'])} bank questions on known pages"
+                                           + (f", {with_scheme} with a stored mark scheme" if refs else "")) if x)
+        if not with_scheme:
+            refs = {}
     if not typed and pages_note.startswith("no_writing"):
         return Outcome(status="needs_teacher", note=pages_note, flags=["unreadable_work"])
     if not typed and not work.readable:
@@ -542,7 +557,7 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     ma = _read_url(assignment.get("modelAnswerUrl") or "", fetch, **ref_kw)
     ms_notes = _note(assignment.get("markingSchemeNotes")) or _note(assignment.get("markingScheme"))
     ma_notes = _note(assignment.get("modelAnswerNotes")) or _note(assignment.get("modelAnswer"))
-    if not (ms.readable or ma.readable or ms_notes or ma_notes):
+    if not (ms.readable or ma.readable or ms_notes or ma_notes or refs):
         return Outcome(status="needs_teacher", note="no_scheme: this assignment has no readable marking scheme or "
                        "model answer. Not graded.", flags=["no_scheme"])
     # When the student's pages ARE the question paper (matched), each page already shows its questions: no extra
@@ -590,6 +605,12 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         read_ok, via1 = 0, ""
         for i, img in enumerate(work.images):
             pno = work.page_numbers[i] if i < len(work.page_numbers) else i + 1
+            # R1.2: a booklet says which questions are on this page, so the numbers are not guessed from the picture
+            # (seen on a practice book: a question's parts were filed under the question before it).
+            on = [str(q.get("n")) for q in questions_on_page(booklet, pno - 1)] if booklet else []
+            known = (f"\nThis page belongs to question{'s' if len(on) > 1 else ''} {', '.join(on)} of the booklet. "
+                     f"Every `ref` starts with {'one of these numbers' if len(on) > 1 else 'this number'}, "
+                     "whatever the student wrote.") if on else ""
             p1 = (paper + f"\nThe attached image is page {pno} of the student's file"
                   + (" (the printed paper, with the student's writing on it: the printed questions are NOT the "
                      "student's work)" if matched else "")
@@ -599,14 +620,20 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                     "start of the question) followed by the part the student is answering, e.g. \"4a\", \"4b\". The "
                     "student's own labels (\"a)\", \"B)\") give only the part: never leave the number out when it is "
                     "printed on the page. Only when no question number is visible on the page, give the part alone."
-                    "\nRespond with JSON of this shape:\n" + TRANSCRIBE_SCHEMA)
+                  + known + "\nRespond with JSON of this shape:\n" + TRANSCRIBE_SCHEMA)
             try:
                 # v2: the printed question number is asked for (v1 pages came back as bare "a)", "B)" parts).
-                got, via1 = pages.get(f"page:v2:{work_url}:{pno}:{int(matched)}", lambda: list(_ask(
+                # v3: a booklet page carries its known question numbers (cached apart from v2 reads).
+                key = f"page:v3:{work_url}:{pno}:{','.join(on)}" if on else f"page:v2:{work_url}:{pno}:{int(matched)}"
+                got, via1 = pages.get(key, lambda p1=p1, img=img: list(_ask(
                     complete, TRANSCRIBE_SYSTEM, p1, [img] + ([] if matched else qp.images), _parse_page, trace,
                     require_vision=True)))
             except (ValueError, ProviderError):
                 continue                          # one page the AI could not read must not lose the others
+            if len(on) == 1:                      # one question on this page: every answer on it is that question's
+                got = [{**t, "ref": t["ref"] if _lead(t["ref"]) == on[0] else on[0] + re.sub(
+                        r"[()\s]", "", re.sub(r"^\s*(?:q(?:uestion)?\s*)?\d*", "", str(t["ref"]), flags=re.I)).lower()}
+                       for t in got]
             read_ok += 1
             per_page.append(got)
             if via1 not in via_all:
@@ -640,9 +667,18 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     answered = {_lead(t["ref"]) for t in transcript if t["transcription"] or t.get("sketch")}
     only_answered = False
     kept: dict[str, list[dict]] = {}              # "ms" / "ma" -> the copied questions given to the marker
+    if refs:
+        # R1.2: each answered question gets its own bank mark scheme and model answer; the assignment's files are not
+        # needed (and not matched by question number).
+        leads = sorted(answered & refs.keys(), key=_ref_order)
+        for name, m in (("ms", ms), ("ma", ma)):
+            kept[name] = [{"ref": n, "text": refs[n][name]} for n in leads if refs[n][name]]
+            m.text, m.images = "\n\n".join(f"Question {q['ref']}:\n{q['text']}" for q in kept[name]), []
+        ms_notes = ma_notes = ""
+        only_answered = True
     for name, key, m in (("ms", assignment.get("markingSchemeUrl") or "", ms),
                          ("ma", assignment.get("modelAnswerUrl") or "", ma)):
-        if not m.images or len(m.images) <= C.MAX_PAGES_REFERENCE:
+        if refs or not m.images or len(m.images) <= C.MAX_PAGES_REFERENCE:
             continue
         copied = copy_reference(key, m, complete, trace, pages)
         if copied is None:
@@ -724,15 +760,20 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
     # practice book); each batch is cached like a page, so a paused paper does not mark a batch twice.
     p2 = prompt(ms.text, ma.text, student)
     batches = [None]
-    if only_answered and len(p2) > C.MARK_PROMPT_CHARS:
+    if only_answered and (refs or len(p2) > C.MARK_PROMPT_CHARS):   # a booklet: always one question at a time
         # Only questions the copied answers cover: one without a model answer would be marked against nothing.
         covered = {_lead(q["ref"]) for name in kept for q in kept[name]}
         leads = sorted(answered & covered, key=_ref_order)
         missing = sorted(answered - covered, key=_ref_order)
         if missing:
             flags.append("no_answer_for_some")
-            pages_note += f"; not marked (no model answer found): {','.join(missing)}"
+            pages_note += (f"; not marked (no stored mark scheme in the bank): {','.join(missing)}" if refs
+                           else f"; not marked (no model answer found): {','.join(missing)}")
         batches = [leads[i:i + C.MARK_BATCH_QUESTIONS] for i in range(0, len(leads), C.MARK_BATCH_QUESTIONS)]
+        if not batches:
+            return Outcome(status="needs_teacher", note="no_scheme: none of the questions answered has a mark scheme or "
+                           "model answer to mark against (" + pages_note[:200] + "). Not graded.",
+                           flags=["no_scheme"], via=" + ".join(via_all))
     all_q: list[QuestionGrade] = []
     overall: list[float] = []
     try:
@@ -751,7 +792,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
                     r, f_, v_ = run_markers(prompt(sub("ms", ms), sub("ma", ma), f"Transcribed handwriting:\n{text_b}\n"),
                                             wt_b)
                     return {"res": r.model_dump(), "flags": f_, "via": v_}
-                got = pages.get(f"mark:v2:{work_url}:{','.join(b)}", make)
+                # v3: marked against the bank's own scheme (a booklet), cached apart from marks made from scanned files.
+                got = pages.get(f"mark:{'v3' if refs else 'v2'}:{work_url}:{','.join(b)}", make)
                 res, fl, vias = GradeResult.model_validate(got["res"]), got["flags"], got["via"]
                 if len(b) == 1:
                     # Marking one question, the AI often numbers its parts "1a, 1b" whatever the question is (seen
