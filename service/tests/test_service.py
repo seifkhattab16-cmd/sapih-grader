@@ -1039,3 +1039,17 @@ def test_a_paper_whose_every_answer_was_left_out_goes_to_the_teacher():
     out = grader_core.grade_submission({**BOOK_A, "leaveOutQuestions": ["3", "7"]}, {"fileUrl": "https://f/omar.pdf"},
                                        BOOK.__getitem__, BookFake())
     assert out.status == "needs_teacher"
+
+
+def test_the_marker_can_give_the_correct_working_for_a_lost_mark():
+    reply = json.dumps({"questions": [
+        {"ref": "1b", "max_marks": 3, "awarded_marks": 0, "feedback": "Turn 0.548 into an angle first.",
+         "correct_working": ["$x = \sin^{-1}(0.548) = 0.580$", "$\pi - 0.580 = 2.56$", "", "a", "b", "c"],
+         "confidence": 0.9, "reason": "r", "marks": [{"type": "B1", "awarded": False, "criterion": "0.58"}]},
+        {"ref": "2", "max_marks": 1, "awarded_marks": 0, "correct_working": "$y = 3$\n$x = 930$", "confidence": 0.9}],
+        "overall_confidence": 0.9})
+    res = grader_core.parse_reply(reply)
+    assert res.questions[0].correct_working[:2] == ["$x = \sin^{-1}(0.548) = 0.580$", "$\pi - 0.580 = 2.56$"]
+    assert len(res.questions[0].correct_working) == 4                  # at most 4 lines, blanks dropped
+    assert res.questions[1].correct_working == ["$y = 3$", "$x = 930$"]  # a string is split into lines
+    assert "correct_working" in grader_core.MARK_SCHEMA and "16-year-old" in grader_core.MARK_SYSTEM

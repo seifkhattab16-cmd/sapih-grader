@@ -90,6 +90,14 @@ class QuestionGrade(BaseModel):
     steps: list[ProofStep] = []          # proofs only
     features: list[SketchFeature] = []   # sketches only
     sketch: str = ""                     # the transcriber's neutral description of a drawn graph, if any
+    correct_working: list[str] = []      # R4.1: the right lines (LaTeX) when marks were lost, for the marked PDF
+
+    @field_validator("correct_working", mode="before")
+    @classmethod
+    def _lines(cls, v):
+        if isinstance(v, str):
+            v = [x for x in v.split("\n")]
+        return [str(x).strip()[:300] for x in (v or []) if str(x).strip()][:4]
 
     @field_validator("confidence")
     @classmethod
@@ -230,6 +238,10 @@ MARK_SYSTEM = (
     "and where a note and the mark scheme disagree, the note wins. TEACHER'S CORRECTIONS are questions on other "
     "students' papers where the teacher changed the AI's mark: follow the same judgement on similar work, but mark "
     "this student only from this student's own lines (rule 1 still holds). "
+    "(11) `feedback` is read by a 16-year-old: short plain sentences to the student (\"you\"), first what was right, "
+    "then what went wrong and how to fix it; no mark codes. When marks were lost, `correct_working` gives the correct "
+    "lines from the mark scheme or model answer (at most 4, each a LaTeX formula in $...$), so the student can see the "
+    "right method; leave it empty when full marks were earned. "
     "Reply with ONLY one JSON object, no prose."
 )
 MARK_SCHEMA = (
@@ -239,7 +251,9 @@ MARK_SCHEMA = (
     '"evidence":"<EXACT copy from the transcription, or empty if not awarded>"}],'
     '"steps":[{"text":"<EXACT copy of one line of the proof>","state":"valid"|"unclear"|"wrong","reason":"<why>"}],'
     '"features":[{"name":"<required feature>","state":"seen"|"missing"|"unsure","evidence":"<copied, or empty>"}],'
-    '"feedback":"<one or two sentences for the student>","confidence":<0..1>,"reason":"<why these marks>"}],'
+    '"feedback":"<one or two sentences for the student>",'
+    '"correct_working":["<only when marks were lost: one line of the correct working in LaTeX, $...$>"],'
+    '"confidence":<0..1>,"reason":"<why these marks>"}],'
     '"overall_confidence":<0..1>}'
 )
 
@@ -837,6 +851,8 @@ def grade_submission(assignment: dict, submission: dict, fetch: Callable[[str], 
         q.transcription = (t["transcription"] if t else typed)[:1500]
         q.legible = t["legible"] if t else True
         q.sketch = (t.get("sketch", "") if t else "")[:800]
+        if q.awarded_marks >= q.max_marks:
+            q.correct_working = []                # full marks: nothing to correct on the marked PDF
         flags.extend(check_work_type(q, work_text, q.sketch, qtexts.get(_lead(q.ref), "")))
     if res.overall_confidence < LOW_CONFIDENCE or any(q.confidence < LOW_CONFIDENCE for q in res.questions):
         flags.append("low_confidence")
